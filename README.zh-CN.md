@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-**一个麦克风,多台 Mac 共享。** 麦克风物理接在一台电脑(服务端)上,局域网内其他电脑(客户端)通过虚拟声卡把它当成本机麦克风使用——无需来回插拔切换。
+**一个麦克风,多台电脑共享。** 麦克风物理接在一台电脑(服务端)上,局域网内其他电脑(客户端)通过虚拟声卡把它当成本机麦克风使用——无需来回插拔切换。桌面端支持 **macOS 与 Windows**(虚拟声卡分别用 BlackHole / VB-Cable),可混搭组网;另有 Android 服务端应用。
 
 ## 需求出发点
 
@@ -47,7 +47,7 @@ MicSync 只解决这一件小事:**让接在一台 Mac 上的麦克风,变成局
 
 ```
 ┌─ 服务端 Mac ─────────────────┐         ┌─ 客户端 Mac × N ─────────────────────┐
-│ 应用启动即监听 API,不开麦     │  HTTP   │ 用户点「使用这个麦克风」               │
+│ 服务开启即监听 API,不开麦     │  HTTP   │ 用户点「使用这个麦克风」               │
 │                              │←────────│   ↓ GET /stream(即请求事件)          │
 │ 收到 /stream → 按需打开麦克风  │         │ 服务端开麦,串流建立                   │
 │   ↓ cpal 采集                │  HTTP   │   ↓ 重采样 + 抖动缓冲                 │
@@ -72,8 +72,8 @@ MicSync 只解决这一件小事:**让接在一台 Mac 上的麦克风,变成局
    - 备选:`brew install blackhole-2ch`(注意:若安装过程中 sudo 授权未完成,brew 可能显示"已安装"但驱动实际没装上;可用 `ls /Library/Audio/Plug-Ins/HAL/` 核对是否存在 `BlackHole2ch.driver`)
 
    > ⚠️ 安装完成后需要**重启电脑**(或执行 `sudo killall coreaudiod` 重启音频服务),BlackHole 才会出现在设备列表中。
-2. 打开 MicSync,切到「💻 客户端」标签
-3. 填服务端地址,输出设备选 **BlackHole 2ch**,点「⚡ 自动跟随本机应用」(或手动模式的「使用这个麦克风」)
+2. 打开 MicSync,切到「💻 客户端」标签——会自动搜索局域网里的服务端,搜到就点一下直接填好地址,不用手输 IP(也可点「🔍 搜索」重搜,或仍然手动填写)
+3. 输出设备选 **BlackHole 2ch**,点「⚡ 自动跟随本机应用」(或手动模式的「使用这个麦克风」)
 4. 在任意应用(Zoom / 微信 / 腾讯会议…)里把麦克风选为 **BlackHole 2ch**
 
 客户端有两种模式:
@@ -82,6 +82,40 @@ MicSync 只解决这一件小事:**让接在一台 Mac 上的麦克风,变成局
 - **🎙 手动使用**:点击立即请求,点「停止使用」立即释放
 
 两种模式下,**同一时间只有一台设备在用**:另一台设备发起请求会自动接管,原设备收到通知后停止(自动跟随模式会等本轮本机使用结束后再恢复待命,不会与接管方拉锯)——人在哪台,麦克风就在哪台。网络闪断/服务端重启会自动重连。
+
+**后台运行(macOS)**:关闭窗口不会退出应用——MicSync 收进菜单栏托盘继续后台服务(Dock 图标同时隐藏),服务端监听与客户端串流都不中断;点菜单栏图标可重新打开主窗口或彻底退出。
+
+**模式记忆**:MicSync 记住你上次退出时的模式——上次以客户端退出,下次打开还是客户端,不会自动开启服务监听;新装用户同样不默认开启服务端(装上就默默被局域网发现是意外行为),点「恢复服务」后才开始监听,此后随退出状态自动恢复。
+
+### Windows 电脑(服务端或客户端)
+
+MicSync 提供 Windows 版(NSIS 安装包,由仓库的 GitHub Actions 工作流构建),macOS 与 Windows 可任意混搭组网:
+
+- **当服务端**:与 macOS 完全一致——服务开启即监听,客户端请求才开麦
+- **当客户端**:虚拟声卡改用免费的 [VB-Cable](https://vb-audio.com/Cable/)(应用内有引导按钮):下载 VBCABLE_Driver_Pack 解压后,右键「以管理员身份运行」`VBCABLE_Setup_x64.exe`,装完**重启电脑**。VB-Cable 是一对设备:MicSync 的「输出到」选 **CABLE Input**(远端声音写入这里),会议软件里把麦克风选为 **CABLE Output**
+- **自动跟随**同样可用:通过 WASAPI 音频会话枚举检测本机应用是否正在从 CABLE Output 录音,无系统版本门槛
+
+### Android 手机当服务端(共享手机的麦克风)
+
+`android/` 目录是一个配套 Android 应用,实现同一套协议——手机的麦克风成为共享麦,Mac 客户端像连 Mac 服务端一样直接用。(macOS 连续互通只能把 **iPhone** 的麦借给 Mac;这个应用补上 Android 的场景,走纯局域网。)
+
+1. 在手机上安装 APK(侧载;构建方法见[开发](#开发)一节)
+2. 打开应用,点「开始共享」——按提示授予录音权限
+3. 在 Mac 客户端里填手机屏幕上显示的 `IP:47800`
+4. 语义与 Mac 服务端一致:客户端请求前麦克风保持完全关闭,最新请求接管旧串流,常驻通知会显示谁在收流
+
+应用以前台服务(microphone 类型)运行并持有 CPU + Wi-Fi 锁,锁屏后串流不断。手机需与 Mac 在同一 Wi-Fi / 网段。
+
+### iPhone 当服务端(共享 iPhone 的麦克风)
+
+iOS 版就是同一个 Tauri 应用构建成的 iPhone App(同一套 Rust 代码与协议)——iPhone 的麦克风成为共享麦,Mac 客户端照常连,不再受 macOS 连续互通「同一 Apple ID」的限制。iOS 没有系统级虚拟声卡(没有 BlackHole 等价物),所以 iPhone 只能当服务端;App 内也只显示服务端面板。
+
+1. 在 iPhone 上安装 App(自签侧载;构建方法见[开发](#开发)一节)
+2. 打开 App,允许首次弹出的麦克风权限——之后自动在局域网监听
+3. 在 Mac 客户端里填 iPhone 屏幕上显示的 `IP:47800`
+4. 语义与 Mac 服务端一致:客户端请求前麦克风保持完全关闭,最新请求接管旧串流
+
+App 在前台时屏幕不会自动锁定,保证服务可达;正在串流时凭后台音频模式(UIBackgroundModes audio),切后台/锁屏也不断流。但**空闲状态下切到后台会被 iOS 挂起**,远端暂时连不上——要用时把 App 带回前台即可。iPhone 需与 Mac 在同一 Wi-Fi / 网段。
 
 ## HTTP API
 
@@ -98,9 +132,20 @@ MicSync 只解决这一件小事:**让接在一台 Mac 上的麦克风,变成局
 # 开发运行(需要 Rust;前端为纯静态页面,无需 npm install)
 npx @tauri-apps/cli@latest dev
 
-# 打包 .app / .dmg
+# 打包 .app / .dmg(macOS 上)/ NSIS 安装包(Windows 上)
 npx @tauri-apps/cli@latest build
 # 产物在 src-tauri/target/release/bundle/
+# 也可直接用仓库的 GitHub Actions 工作流(.github/workflows/build.yml)同时出双平台安装包
+
+# Android 服务端应用(需要 JDK 17 + Android SDK)
+cd android
+./gradlew test           # 协议测试在 JVM 上跑假采集,无需真机
+./gradlew assembleDebug  # APK 产物在 app/build/outputs/apk/debug/
+
+# iOS 服务端 App(需要 Xcode + rustup;首次先 rustup target add aarch64-apple-ios aarch64-apple-ios-sim)
+npm install                      # 安装 tauri CLI,Xcode 构建脚本会调用它
+npx tauri ios dev "iPhone 17"    # 模拟器运行
+npx tauri ios build              # 真机 .ipa(需在 tauri.conf.json 配置签名团队)
 ```
 
 首次运行服务端时 macOS 会弹出麦克风权限请求;客户端首次连接会弹出局域网访问权限请求,均需允许。
@@ -108,18 +153,31 @@ npx @tauri-apps/cli@latest build
 ## 技术要点
 
 - **Tauri 2** + 纯静态前端(无 Node 依赖)
-- **cpal** 做音频采集/播放(CoreAudio)
+- **cpal** 做音频采集/播放(macOS/iOS 走 CoreAudio,Windows 走 WASAPI)
 - 极简 HTTP 服务(std 手写,无框架):`/health` 探活 + `/stream` 串流,流正文为 `MSY1` 魔数头 + 长度前缀 PCM i16 帧,`TCP_NODELAY` 低延迟
 - **按需开麦**:服务端启动只监听 API,不碰麦克风;每次 `/stream` 会话独占一条 cpal 采集流,会话结束(断开/被接管)立即释放——系统的麦克风指示灯只在真正使用时亮起
-- **自动跟随检测**(客户端):待命期查 BlackHole 设备的 `kAudioDevicePropertyDeviceIsRunningSomewhere`(此时客户端不持有任何流,它变 true 即「有应用开始用虚拟麦克风」);收流期自己在播放、该属性恒 true,改查 macOS 14+ 的 Process Objects API(`kAudioHardwarePropertyProcessObjectList`,即系统橙色麦克风指示灯的数据源)判断「除本进程外是否仍有进程在采集」。轮询本机 HAL 属性,单次约 3ms,300ms 一查
+- **自动跟随检测**(客户端):待命期查 BlackHole 设备的 `kAudioDevicePropertyDeviceIsRunningSomewhere`(此时客户端不持有任何流,它变 true 即「有应用开始用虚拟麦克风」);收流期自己在播放、该属性恒 true,改查 macOS 14+ 的 Process Objects API(`kAudioHardwarePropertyProcessObjectList`,即系统橙色麦克风指示灯的数据源)判断「除本进程外是否仍有进程在采集」。轮询本机 HAL 属性,单次约 3ms,300ms 一查。Windows 上同一状态机换 WASAPI 实现:VB-Cable 是渲染端(CABLE Input)/ 采集端(CABLE Output)成对设备,播放与检测天然分离——用 `IAudioSessionManager2` 枚举采集端上的活跃音频会话即可,两个信号取自同一次枚举
+- **服务发现**(借鉴 LocalSend 的双路设计,客户端点一下就填好地址):
+  - **组播查询/应答**:客户端向 `224.0.0.167:47801` 发查询,在场服务端单播应答。组地址沿用 LocalSend 踩出来的经验值——它落在 `224.0.0.0/24`,部分 Android 实现会直接丢弃该段之外的组播;端口用自己的,与 LocalSend 的 53317 错开(组地址可共用,内核按端口分流)。与 LocalSend 周期性 announce 不同,这里做成客户端发起:没人搜索时组播网络上零流量,与「按需开麦」同一性质。服务端启动时额外通告一次,让开着的客户端立刻看到它上线
+  - **`/health` 子网扫描**:并发探测各 /24 内每个 IP。这不只是组播被封时的备胎——**iOS 服务端只能靠它被发现**:iOS 收发组播需要 Apple 特批的受限授权(`com.apple.developer.networking.multicast`),自签侧载拿不到。`/health` 本就返回 `{"app":"micsync"}`,天然是发现签名。假定 /24(与 LocalSend 同款取舍:拿不到子网掩码,更大的网段靠组播)
+  - 两路并发跑、合并去重。桌面端自身既是服务端又是客户端,一定会发现自己——靠 `/health` 里的 fingerprint 摘掉(比按本机 IP 判断更可靠,多网卡/回环都不漏);0.5.0 之前的服务端没有该字段,退回按本机 IP 兜底,避免混版本局域网「搜不到却手输可连」
+  - 扫描只在用户点「搜索」或首次进入客户端页时跑一次,不挂定时器——它会向整个 /24 发起连接,不该在后台反复进行
+- **授权同意**(自动发现让「偷用」只差一次点击,因此开麦前必须先过人这一关):
+  - 客户端请求 `/stream` 时带上自己的设备名与令牌。**未授权的请求会被挂起**,服务端弹窗问机主:拒绝 / 允许一次 / 始终允许——**同意之前一步都不碰麦克风**,连会话都不占。30 秒无人应答按拒绝处理,不把对方的客户端吊死
+  - **两种身份别混用**:`device_id` 是公开的(出现在 `/health` 与组播通告里),只用于发现时认出自己;信任凭据是服务端在「始终允许」时**签发的随机令牌**,一服务端一客户端一个,从不出现在任何公开接口。反过来做——拿公开 id 当信任凭据——等于谁扫一下对方 `/health` 就能冒充他被放行,「始终允许」就成了虚假的安全感
+  - 令牌由服务端签发、客户端按对方 `device_id` 存档,每对设备各自独立:即便某个恶意服务端拿到了你的令牌,也冒充不了你去连别的服务端
+  - **被拒绝是终态**:客户端收到 403 立刻停止,绝不自动重试——否则就成了每 1.5 秒给对方弹一次窗的骚扰
+  - 对方设备名是不可信输入:滤掉控制字符(换行会破坏 HTTP 头)并限长 40 字,再进弹窗
 - **抢占式单串流**:同一时间只有一条串流;新请求接管旧串流,旧客户端收到明确的结束帧后停止(不自动抢回,避免设备间来回拉锯)
 - 客户端 60ms 起播水位 + 300ms 缓冲上限(超限丢旧数据保延迟),流式线性重采样兼容任意采样率组合
 - 串流期间带宽约 0.8 Mbps(48kHz · 16bit · 单声道);无人使用时零音频流量、零麦克风占用
 - 虚拟麦克风由 [BlackHole](https://github.com/ExistentialAudio/BlackHole) 回环驱动提供;自研 CoreAudio HAL 驱动(免装 BlackHole)列为后续方向
+- **iOS 版**:同一套 Rust 代码,用 `cfg` 在编译期裁掉客户端/自动跟随角色(iOS 无虚拟声卡);启动时配置 AVAudioSession(PlayAndRecord + MixWithOthers)并申请录音权限,采集链路仍走 cpal(AudioUnit);AudioToolbox/CoreAudio/AVFoundation 在 `gen/apple/project.yml` 中显式链接(Rust staticlib 的 `#[link]` 不会传给 Xcode)
 
 ## 已知限制 / 后续方向
 
 - 发起使用到出声之间有开麦初始化(通常 <1s)+ 60ms 起播水位的一次性延迟;建立后为持续低延迟串流
 - 自动跟随的「结束」信号只能近似:其他进程用哪个设备采集因隐私不可见(`pdv#` 返回空),故本机若还有别的应用在采集任意麦克风(如听写),远端麦克风会保持占用直到它也停止
-- 接管是无条件的(局域网内任何客户端都可接管),未做加密/鉴权,请仅在可信局域网使用
+- 授权步骤解决的是「没打招呼就用了你的麦克风」。MicSync 以局域网可信为前提设计,传输不加密
+- 已授权设备之间的接管是无条件的(任一已授权设备发起请求都会接管当前串流)——这是设计意图:麦克风跟着人走
 - 后续可选:Opus 压缩(跨网段/弱网)、mDNS 自动发现服务端、自研 HAL 驱动

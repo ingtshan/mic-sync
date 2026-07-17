@@ -49,6 +49,17 @@ h1 {
   color: var(--text-dim);
 }
 
+/* 移动端(iOS/Android):只有服务端形态(没有虚拟声卡,客户端角色不可用),
+   隐藏 tab 切换;适配刘海/挖孔安全区 */
+body.mobile {
+  padding-top: calc(env(safe-area-inset-top) + 12px);
+  padding-bottom: calc(env(safe-area-inset-bottom) + 20px);
+}
+
+body.mobile .tabs {
+  display: none;
+}
+
 .tabs {
   display: flex;
   gap: 8px;
@@ -281,6 +292,180 @@ input:focus {
   border-color: var(--accent);
 }
 
+/* 授权确认:盖住全屏——有人要用你的麦克风,这个决定不该被忽略掉 */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 100;
+}
+
+.consent-card {
+  background: var(--card);
+  border: 1px solid var(--accent);
+  border-radius: 16px;
+  padding: 22px;
+  max-width: 360px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: center;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+
+.consent-icon {
+  font-size: 34px;
+}
+
+.consent-title {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.consent-addr {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: "SF Mono", Menlo, monospace;
+}
+
+.consent-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.consent-actions .btn {
+  flex: 1;
+  margin-top: 0;
+  padding: 10px 6px;
+  font-size: 13px;
+  background: var(--card-border);
+  color: var(--text);
+}
+
+.consent-actions .btn.primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.consent-actions .btn.danger {
+  background: rgba(255, 91, 91, 0.15);
+  color: var(--red);
+}
+
+.consent-actions .btn.danger:hover {
+  background: var(--red);
+  color: #fff;
+}
+
+/* 已授权设备:一行一个,右侧撤销 */
+.trusted-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.trusted-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.trusted-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 标签与「搜索」按钮同行 */
+.field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.field-row .field-label {
+  margin-top: 0;
+}
+
+.btn.tiny {
+  margin-top: 0;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--card-border);
+  color: var(--text);
+  border-radius: 6px;
+}
+
+.btn.tiny:hover:not(:disabled) {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 发现结果:点一下就填好地址 */
+.peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.peer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.peer:hover {
+  border-color: var(--accent);
+}
+
+.peer.selected {
+  border-color: var(--accent);
+  background: rgba(91, 140, 255, 0.1);
+}
+
+.peer-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.peer-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.peer-alias {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.peer-addr {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: "SF Mono", Menlo, monospace;
+}
+
 .banner {
   background: rgba(255, 201, 61, 0.08);
   border: 1px solid rgba(255, 201, 61, 0.35);
@@ -328,4 +513,177 @@ input:focus {
   text-align: center;
   font-size: 11px;
   color: var(--text-dim);
+}
+
+/* ============ 移动端面板:大录音按钮 + 实时音波 ============ */
+
+body.mobile .app-header {
+  flex-direction: column;
+  text-align: center;
+  gap: 4px;
+  margin-bottom: 0;
+}
+
+body.mobile .logo {
+  display: none; /* 大麦克风按钮本身就是主视觉,顶部 logo 让位 */
+}
+
+#panel-mobile {
+  gap: 16px;
+  align-items: center;
+}
+
+#panel-mobile > * {
+  width: 100%;
+}
+
+.mic-stage {
+  position: relative;
+  height: 36vh;
+  min-height: 240px;
+  max-height: 360px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#wave-canvas {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 100%;
+  height: 180px;
+  pointer-events: none;
+}
+
+.mic-btn {
+  position: relative;
+  z-index: 2;
+  width: 148px;
+  height: 148px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.15s, box-shadow 0.35s, background 0.35s, color 0.35s;
+}
+
+.mic-btn:active {
+  transform: scale(0.94);
+}
+
+.mic-btn:disabled {
+  opacity: 0.6;
+}
+
+.mic-btn svg {
+  width: 58px;
+  height: 58px;
+}
+
+.mic-btn.armed {
+  background: radial-gradient(circle at 32% 28%, #7da4ff, #4a77e8 72%);
+  box-shadow: 0 12px 44px rgba(91, 140, 255, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+.mic-btn.live {
+  background: radial-gradient(circle at 32% 28%, #52e59b, #17b568 72%);
+  box-shadow: 0 12px 48px rgba(61, 220, 132, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+.mic-btn.paused {
+  background: #232734;
+  color: var(--text-dim);
+  box-shadow: inset 0 0 0 1px var(--card-border);
+}
+
+/* 使用中:呼吸扩散圆环 */
+.mic-btn::before,
+.mic-btn::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 2px solid rgba(61, 220, 132, 0.8);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mic-btn.live::before {
+  animation: mic-pulse 2.4s ease-out infinite;
+}
+
+.mic-btn.live::after {
+  animation: mic-pulse 2.4s ease-out 1.2s infinite;
+}
+
+@keyframes mic-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  70%,
+  100% {
+    transform: scale(1.45);
+    opacity: 0;
+  }
+}
+
+.mobile-status {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.dot.blue {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+.mobile-sub {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-align: center;
+  line-height: 1.6;
+  padding: 0 14px;
+}
+
+.mobile-conn {
+  align-items: center;
+  text-align: center;
+}
+
+.mobile-conn .ip-list {
+  justify-content: center;
+}
+
+.mobile-conn .ip-chip {
+  font-size: 15px;
+  padding: 8px 14px;
+}
+
+.mobile-advanced summary {
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 4px 6px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-advanced[open] summary {
+  margin-bottom: 8px;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }

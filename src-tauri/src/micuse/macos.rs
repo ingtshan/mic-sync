@@ -1,9 +1,16 @@
-//! 本机麦克风使用检测:通过 CoreAudio HAL 的 Process Objects API(macOS 14+,
+//! macOS 实现:通过 CoreAudio HAL 的 Process Objects API(macOS 14+,
 //! 即系统橙色麦克风指示灯的数据源)查询「除本进程外,是否有进程正在从指定设备
 //! (通常是 BlackHole)采集输入」。BlackHole 自身没有 IPC 接口,但它是标准
 //! CoreAudio 设备,会议软件把它当麦克风采集时在 HAL 里可见。
+//! macOS 上播放目标与检测目标是同一个设备(BlackHole 回环),
+//! 所以 MonitorTarget 就是该输出设备的 AudioObjectID。
 
 use std::ffi::c_void;
+
+use super::MicUse;
+
+/// 监视目标:BlackHole 设备的 AudioObjectID
+pub type MonitorTarget = u32;
 
 type AudioObjectID = u32;
 type OSStatus = i32;
@@ -153,14 +160,17 @@ fn object_name(object: AudioObjectID) -> Option<String> {
     }
 }
 
-/// 按名称查找音频设备 ID(精确匹配优先,其次包含匹配);找不到返回 None
-pub fn find_device_by_name(name: &str) -> Option<u32> {
+/// 由输出设备名找到监视目标(macOS 上即该设备本身;精确匹配优先,其次包含匹配)
+pub fn find_monitor_target(output_device_name: &str) -> Option<MonitorTarget> {
     let devices = get_vec_u32(SYSTEM_OBJECT, PROP_DEVICES)?;
     let mut fuzzy = None;
     for id in devices {
         match object_name(id) {
-            Some(n) if n == name => return Some(id),
-            Some(n) if fuzzy.is_none() && (n.contains(name) || name.contains(&n)) => {
+            Some(n) if n == output_device_name => return Some(id),
+            Some(n)
+                if fuzzy.is_none()
+                    && (n.contains(output_device_name) || output_device_name.contains(&n)) =>
+            {
                 fuzzy = Some(id)
             }
             _ => {}
@@ -169,29 +179,18 @@ pub fn find_device_by_name(name: &str) -> Option<u32> {
     fuzzy
 }
 
-/// 检测结果
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MicUse {
-    /// 有其他进程正在从该设备采集输入(会议软件在用这个"麦克风")
-    InUse,
-    /// 没有其他进程在采集
-    Idle,
-    /// 系统不支持 Process Objects API(macOS < 14)
-    Unsupported,
-}
-
 /// 设备上是否有任意进程(含本进程)正在跑 IO。
 /// 待命期我们不持有 BlackHole 的任何流,此值变 true 即「有应用开始用它」——
 /// 这是"开始使用"的精确信号;一旦我们自己开始播放,该值恒 true,失效。
-pub fn device_running_somewhere(device_id: u32) -> bool {
-    get_u32(device_id, PROP_DEV_RUNNING_SOMEWHERE) == Some(1)
+pub fn device_running_somewhere(target: &MonitorTarget) -> bool {
+    get_u32(*target, PROP_DEV_RUNNING_SOMEWHERE) == Some(1)
 }
 
 /// 除本进程外,是否有进程正在采集输入(macOS 14+ Process Objects)。
 /// 用作"使用中→结束"的信号。注意:其他进程的设备列表(pdv#)通常因隐私
 /// 不可见(返回空),此时无法归因到具体设备,只能按「有无进程在采集」近似;
 /// 列表可见时才按设备过滤。
-pub fn other_process_capturing(device_id: u32) -> MicUse {
+pub fn other_process_capturing(target: &MonitorTarget) -> MicUse {
     let Some(procs) = get_vec_u32(SYSTEM_OBJECT, PROP_PROCESS_LIST) else {
         return MicUse::Unsupported;
     };
@@ -205,7 +204,7 @@ pub fn other_process_capturing(device_id: u32) -> MicUse {
         }
         // 设备列表可见且明确不含目标设备 → 排除;否则(不可见/含目标)计入
         match get_vec_u32(p, PROP_PROC_DEVICES) {
-            Some(ds) if !ds.is_empty() && !ds.contains(&device_id) => continue,
+            Some(ds) if !ds.is_empty() && !ds.contains(target) => continue,
             _ => return MicUse::InUse,
         }
     }
@@ -249,13 +248,13 @@ mod tests {
     #[ignore = "打真实 CoreAudio HAL,手动运行验证"]
     fn probe_micuse() {
         let t0 = Instant::now();
-        let dev = find_device_by_name("BlackHole 2ch");
-        println!("[{:?}] find_device_by_name(BlackHole 2ch) = {dev:?}", t0.elapsed());
+        let dev = find_monitor_target("BlackHole 2ch");
+        println!("[{:?}] find_monitor_target(BlackHole 2ch) = {dev:?}", t0.elapsed());
         if let Some(dev) = dev {
             let t1 = Instant::now();
-            let usage = other_process_capturing(dev);
+            let usage = other_process_capturing(&dev);
             println!("[{:?}] other_process_capturing = {usage:?}", t1.elapsed());
-            let busy = device_running_somewhere(dev);
+            let busy = device_running_somewhere(&dev);
             println!("device_running_somewhere = {busy}");
         }
         let t2 = Instant::now();

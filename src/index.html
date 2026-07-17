@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <title>MicSync</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -20,14 +20,35 @@
     <button id="tab-client" class="tab">💻 客户端(用麦克风)</button>
   </nav>
 
+  <!-- 授权确认:有人想用本机麦克风时弹出,盖在最上层——这是必须看见的决定 -->
+  <div id="consent-overlay" class="overlay hidden">
+    <div class="consent-card">
+      <div class="consent-icon">🎙️</div>
+      <p class="consent-title">「<span id="consent-name"></span>」<br />想使用这台设备的麦克风</p>
+      <p class="consent-addr" id="consent-addr"></p>
+      <p class="hint">对方看到的名字由对方自己填写,认不出就选「拒绝」。同意后对方才能打开你的麦克风。</p>
+      <div class="consent-actions">
+        <button id="btn-consent-deny" class="btn danger">拒绝</button>
+        <button id="btn-consent-once" class="btn">允许一次</button>
+        <button id="btn-consent-always" class="btn primary">始终允许</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ============ 服务端面板 ============ -->
   <main id="panel-server" class="panel">
     <section class="card">
-      <label class="field-label" for="input-device">共享的麦克风设备(更换对下一次使用生效)</label>
-      <select id="input-device"></select>
+      <label class="field-label" for="device-name">本机设备名(对方请求时看到的就是它)</label>
+      <input id="device-name" type="text" maxlength="40" placeholder="例如 张三的 MacBook" />
 
-      <label class="field-label" for="server-port">监听端口(暂停服务后可改)</label>
-      <input id="server-port" type="number" value="47800" min="1024" max="65535" />
+      <!-- 移动端启动时会把这组控件整体挪进「高级设置」,同一套元素免状态同步 -->
+      <div id="server-controls" class="stack">
+        <label class="field-label" for="input-device">共享的麦克风设备(更换对下一次使用生效)</label>
+        <select id="input-device"></select>
+
+        <label class="field-label" for="server-port">监听端口(暂停服务后可改)</label>
+        <input id="server-port" type="number" value="47800" min="1024" max="65535" />
+      </div>
 
       <button id="btn-server-toggle" class="btn primary">⏸ 暂停服务</button>
       <p class="hint">应用启动后自动在局域网监听,无需手动开启。平时完全不收音——只有客户端请求使用时才会打开麦克风,对方停止即关闭。</p>
@@ -56,6 +77,12 @@
       </div>
     </section>
 
+    <section id="trusted-card" class="card hidden">
+      <div class="k">已授权使用本机麦克风的设备</div>
+      <div id="trusted-list" class="peer-list"></div>
+      <p class="hint">撤销后,该设备下次再请求会重新弹出确认。</p>
+    </section>
+
     <p id="server-error" class="error hidden"></p>
   </main>
 
@@ -71,16 +98,28 @@
       <p class="hint">⚠️ 安装完成后需要<strong>重启电脑</strong>(或在终端执行 <code class="inline">sudo killall coreaudiod</code> 重启音频服务),BlackHole 才会生效。生效后本提示会自动消失,之后在其他软件里选择「BlackHole 2ch」作为麦克风即可。</p>
     </div>
 
+    <div id="vbcable-banner" class="banner hidden">
+      <strong>⚠️ 未检测到 VB-Cable 虚拟声卡</strong>
+      <p>客户端需要 VB-Cable 才能把远端麦克风虚拟成本机麦克风。前往官网下载 VBCABLE_Driver_Pack(免费),解压后右键「以管理员身份运行」VBCABLE_Setup_x64.exe 完成安装:</p>
+      <button id="btn-download-vbcable" class="btn small accent">⬇ 前往官网下载 VB-Cable</button>
+      <p class="hint">⚠️ 安装完成后需要<strong>重启电脑</strong>,VB-Cable 才会生效。生效后本提示会自动消失,之后「输出到」选择「CABLE Input」,会议软件里选择「CABLE Output」作为麦克风即可。</p>
+    </div>
+
     <section class="card">
-      <label class="field-label" for="server-addr">服务端地址</label>
+      <div class="field-row">
+        <label class="field-label" for="server-addr">服务端地址</label>
+        <button id="btn-discover" class="btn tiny">🔍 搜索</button>
+      </div>
+      <div id="discover-list" class="peer-list hidden"></div>
+      <p id="discover-hint" class="hint hidden"></p>
       <input id="server-addr" type="text" placeholder="例如 192.168.1.10 或 192.168.1.10:47800" />
 
-      <label class="field-label" for="output-device">输出到(选 BlackHole 即虚拟麦克风)</label>
+      <label id="output-device-label" class="field-label" for="output-device">输出到(选 BlackHole 即虚拟麦克风)</label>
       <select id="output-device"></select>
 
       <button id="btn-follow-toggle" class="btn primary">⚡ 自动跟随本机应用</button>
       <button id="btn-client-toggle" class="btn">🎙 手动使用这个麦克风</button>
-      <p class="hint">「自动跟随」:检测到本机有应用把 BlackHole 当麦克风采集(如进入会议)时,自动向服务端请求麦克风;应用停止采集约 2 秒后自动释放、远端关麦——全程无需手动点击(需 macOS 14+)。「手动使用」则立即请求、手动停止。两种模式下,另一台设备发起请求都会自动接管,本机随之停止——人在哪台设备,麦克风就跟到哪台。</p>
+      <p id="follow-hint" class="hint">「自动跟随」:检测到本机有应用把 BlackHole 当麦克风采集(如进入会议)时,自动向服务端请求麦克风;应用停止采集约 2 秒后自动释放、远端关麦——全程无需手动点击(需 macOS 14+)。「手动使用」则立即请求、手动停止。两种模式下,另一台设备发起请求都会自动接管,本机随之停止——人在哪台设备,麦克风就跟到哪台。</p>
     </section>
 
     <section id="client-info" class="card hidden">
@@ -96,10 +135,41 @@
         <div><span class="k">缓冲</span><span id="client-buffer" class="v">0 ms</span></div>
         <div><span class="k">源采样率</span><span id="client-rate" class="v">—</span></div>
       </div>
-      <p class="hint">✅ 现在在 Zoom / 微信 / 腾讯会议等应用中选择「BlackHole 2ch」作为麦克风即可。</p>
+      <p id="client-usage-hint" class="hint">✅ 现在在 Zoom / 微信 / 腾讯会议等应用中选择「BlackHole 2ch」作为麦克风即可。</p>
     </section>
 
     <p id="client-error" class="error hidden"></p>
+  </main>
+
+  <!-- ============ 移动端面板(iOS/Android:纯服务端形态) ============ -->
+  <main id="panel-mobile" class="panel hidden">
+    <section class="mic-stage">
+      <canvas id="wave-canvas"></canvas>
+      <button id="btn-mic" class="mic-btn armed" aria-label="暂停或恢复麦克风共享">
+        <svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z" />
+          <path d="M19 11a7 7 0 0 1-14 0" />
+          <line x1="12" y1="18" x2="12" y2="22" />
+        </svg>
+      </button>
+    </section>
+
+    <div class="mobile-status">
+      <span id="mobile-dot" class="dot gray"></span>
+      <span id="mobile-summary">正在启动…</span>
+    </div>
+    <p id="mobile-sub" class="mobile-sub"></p>
+
+    <section id="mobile-conn" class="card mobile-conn hidden">
+      <div class="k">在电脑端 MicSync 填入这个地址即可使用</div>
+      <div id="mobile-ips" class="ip-list"></div>
+    </section>
+
+    <details class="mobile-advanced">
+      <summary>⚙️ 高级设置</summary>
+      <div id="mobile-advanced-body" class="card"></div>
+    </details>
   </main>
 
   <footer class="app-footer">局域网低延迟传输 · 按需开麦零常驻 · PCM 16bit 单声道</footer>

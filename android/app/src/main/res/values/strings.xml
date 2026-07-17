@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MicSync</string>
+    <string name="subtitle">Share this phone\'s microphone with computers on your LAN</string>
+    <string name="label_address">Enter this address in MicSync on your computer</string>
+    <string name="no_network">No LAN connection</string>
+    <string name="btn_mic_desc">Start or stop microphone sharing</string>
+    <string name="status_paused">Sharing paused</string>
+    <string name="sub_paused">Tap the button above to share. Computers can then discover and use this phone\'s mic.</string>
+    <string name="status_armed">Standing by · port %1$d</string>
+    <string name="sub_armed">Mic is fully closed right now. When a computer requests it, it opens automatically and the live waveform appears.</string>
+    <string name="status_live">Mic in use</string>
+    <string name="sub_live">Capturing — streaming to %1$s</string>
+    <string name="status_error">Mic error: %s</string>
+    <string name="consent_title">“%1$s” wants to use this phone\'s microphone</string>
+    <string name="consent_message">Request from %1$s</string>
+    <string name="consent_once">Just once</string>
+    <string name="consent_always">Always allow</string>
+    <string name="consent_deny">Deny</string>
+    <string name="err_no_mic_permission">Microphone permission is required to share the mic</string>
+    <string name="err_port">Failed to listen on port %1$d: %2$s</string>
+    <string name="notif_channel">Mic server status</string>
+    <string name="notif_idle">Standing by — mic closed, waiting for a client</string>
+    <string name="notif_streaming">Streaming mic to %s</string>
+    <string name="action_stop">Stop</string>
+    <string name="hint">The mic stays fully closed until a computer requests it. Keep this phone on the same Wi-Fi as your computer.</string>
+</resources>

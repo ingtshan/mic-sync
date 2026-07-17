@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MicSync</string>
+    <string name="subtitle">把手机的麦克风共享给局域网里的电脑</string>
+    <string name="label_address">在电脑端 MicSync 填入这个地址即可使用</string>
+    <string name="no_network">未连接局域网</string>
+    <string name="btn_mic_desc">开始或停止麦克风共享</string>
+    <string name="status_paused">共享已暂停</string>
+    <string name="sub_paused">点上方按钮开始共享，电脑才能搜到并使用这台手机的麦克风。</string>
+    <string name="status_armed">待命中 · 端口 %1$d</string>
+    <string name="sub_armed">现在完全不收音。电脑端一发起使用，这里会自动开麦并跳出实时音波。</string>
+    <string name="status_live">麦克风使用中</string>
+    <string name="sub_live">正在收音，实时传给 %1$s</string>
+    <string name="status_error">麦克风错误：%s</string>
+    <string name="consent_title">「%1$s」请求使用这台手机的麦克风</string>
+    <string name="consent_message">来自 %1$s</string>
+    <string name="consent_once">仅此一次</string>
+    <string name="consent_always">始终允许</string>
+    <string name="consent_deny">拒绝</string>
+    <string name="err_no_mic_permission">需要录音权限才能共享麦克风</string>
+    <string name="err_port">监听端口 %1$d 失败：%2$s</string>
+    <string name="notif_channel">麦克风服务状态</string>
+    <string name="notif_idle">待命中 — 麦克风关闭，等待客户端请求</string>
+    <string name="notif_streaming">正在向 %s 送出麦克风</string>
+    <string name="action_stop">停止</string>
+    <string name="hint">电脑请求前，麦克风保持完全关闭。请确保手机与电脑在同一 Wi-Fi。</string>
+</resources>

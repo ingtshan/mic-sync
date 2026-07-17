@@ -1,4 +1,4 @@
-//! 自动跟随:监视本机应用对 BlackHole 的采集(micuse 模块),
+//! 自动跟随:监视本机应用对虚拟声卡(BlackHole / VB-Cable)的采集(micuse 模块),
 //! 检测到有应用把它当麦克风用 → 自动向服务端认领 /stream(远端开麦);
 //! 应用停止采集(静默挂起时长后)→ 自动释放(远端关麦)。
 //! 被其他设备接管时进入抑制态,等本轮本机使用结束后再重新武装,避免设备间拉锯。
@@ -27,10 +27,12 @@ pub enum Phase {
     Active = 1,
     /// 被其他设备接管:等本轮本机使用结束后回到待命
     Suppressed = 2,
-    /// 找不到目标输出设备(BlackHole 未安装/被拔出)
+    /// 找不到目标输出设备(虚拟声卡未安装/被拔出)
     DeviceMissing = 3,
-    /// 系统不支持(macOS < 14 无 Process Objects API)
+    /// 系统不支持(如 macOS < 14 无 Process Objects API)
     Unsupported = 4,
+    /// 本轮使用结束(正常释放或服务端停止)后的排空:等设备空闲再重新武装
+    Draining = 5,
 }
 
 impl Phase {
@@ -40,6 +42,7 @@ impl Phase {
             2 => Phase::Suppressed,
             3 => Phase::DeviceMissing,
             4 => Phase::Unsupported,
+            5 => Phase::Draining,
             _ => Phase::Armed,
         }
     }
@@ -51,6 +54,7 @@ impl Phase {
             Phase::Suppressed => "suppressed",
             Phase::DeviceMissing => "device_missing",
             Phase::Unsupported => "unsupported",
+            Phase::Draining => "draining",
         }
     }
 }
@@ -82,14 +86,17 @@ impl FollowGate {
     }
 
     /// 双信号驱动:
-    /// device_busy —— BlackHole 上有任意进程在跑 IO('gone';待命期我们不持有流,
-    ///   它变 true 即「本机应用开始用虚拟麦克风」,是精确的开始信号);
-    /// other_capturing —— 除本进程外有进程在采集输入(使用中我们自己在播放,
-    ///   device_busy 恒 true 失效,用它判断本机应用是否已停止)。
+    /// device_busy —— 虚拟声卡上有任意进程在跑 IO('gone')。单独不可作开始信号:
+    ///   模拟器麦克风桥接、系统音频路由等会把它长期顶成 true;
+    /// other_capturing —— 除本进程外有进程在采集输入(Process Objects;隐私遮蔽下
+    ///   无法归因到具体设备)。单独也不可靠:别的应用用真麦克风也会为 true。
+    /// 待命期两者同时成立才认领(设备在跑 + 有人在采集 ≈ 有应用把它当麦克风);
+    /// 使用中/排空/抑制期只看 other_capturing——我们自己的播放会把 device_busy
+    /// 顶成恒 true,而纯输出的占用(含自己播放的余量)不该阻塞状态机。
     fn step(&mut self, device_busy: bool, other_capturing: bool, now_ms: u64) -> FollowAction {
         match self.phase {
             Phase::Armed => {
-                if device_busy {
+                if device_busy && other_capturing {
                     self.phase = Phase::Active;
                     self.idle_since_ms = None;
                     FollowAction::Claim
@@ -108,19 +115,20 @@ impl FollowGate {
                         FollowAction::None
                     }
                     Some(t) if now_ms.saturating_sub(t) >= self.hangover_ms => {
-                        // 释放后进入抑制态排空:等我们自己的播放流关闭、
+                        // 释放后进入排空态:等我们自己的播放流关闭、
                         // device_busy 回落后再武装,避免把自己的余量当新事件
-                        self.phase = Phase::Suppressed;
+                        self.phase = Phase::Draining;
                         self.idle_since_ms = None;
                         FollowAction::Release
                     }
                     Some(_) => FollowAction::None,
                 }
             }
-            // 抑制态:设备完全空闲(本机应用与我们的播放都停了)才重新武装,
-            // 既做释放后的排空,也避免被接管后与接管方拉锯
-            Phase::Suppressed => {
-                if !device_busy {
+            // 排空/抑制:等本机采集停止(本轮结束)再重新武装。不等设备空闲——
+            // 设备可能被模拟器桥接/系统路由长期占用,等空闲会永远卡死;
+            // 认领条件已含 other_capturing,自己播放的余量(纯输出)不会误触发
+            Phase::Draining | Phase::Suppressed => {
+                if !other_capturing {
                     self.phase = Phase::Armed;
                 }
                 FollowAction::None
@@ -129,10 +137,14 @@ impl FollowGate {
         }
     }
 
-    /// 内层会话被服务端结束(被接管/服务停止)
-    fn on_session_ended(&mut self) {
+    /// 内层会话被服务端结束:被接管进抑制态,服务端停止只做排空
+    fn on_session_ended(&mut self, preempted: bool) {
         if self.phase == Phase::Active {
-            self.phase = Phase::Suppressed;
+            self.phase = if preempted {
+                Phase::Suppressed
+            } else {
+                Phase::Draining
+            };
             self.idle_since_ms = None;
         }
     }
@@ -192,11 +204,15 @@ impl Drop for FollowHandle {
     }
 }
 
-/// 启动自动跟随。output_device 必须是 BlackHole 一类的回环设备名,
-/// 检测目标与播放目标是同一个设备。
+/// 启动自动跟随。output_device 必须是虚拟回环声卡的输出端名称;
+/// 检测目标由 micuse 平台实现从它推导(macOS 即 BlackHole 本身,
+/// Windows 为 CABLE Input 成对的采集端 CABLE Output)。
 pub fn start(addr: String, output_device: String) -> Result<FollowHandle, String> {
-    if !output_device.contains("BlackHole") {
-        return Err("自动跟随需要选择 BlackHole 输出设备(检测的就是它的使用状态)".into());
+    if !crate::audio::is_virtual_mic_output(&output_device) {
+        return Err(format!(
+            "自动跟随需要选择 {} 输出设备(检测的就是它的使用状态)",
+            crate::audio::VIRTUAL_MIC_LABEL
+        ));
     }
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
@@ -225,39 +241,45 @@ pub fn start(addr: String, output_device: String) -> Result<FollowHandle, String
     })
 }
 
+/// 系统不支持自动跟随时给用户的提示
+#[cfg(target_os = "macos")]
+const UNSUPPORTED_MSG: &str = "自动跟随需要 macOS 14 及以上(Process Objects API),请改用手动模式";
+#[cfg(not(target_os = "macos"))]
+const UNSUPPORTED_MSG: &str = "当前系统不支持自动跟随,请改用手动模式";
+
 fn follow_thread(addr: String, device_name: String, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
     let mut gate = FollowGate::new(RELEASE_HANGOVER_MS);
     let start = Instant::now();
-    let mut device_id: Option<u32> = None;
+    let mut target: Option<micuse::MonitorTarget> = None;
 
     while !stop.load(Ordering::SeqCst) {
-        // 找目标设备(支持热插拔/晚装 BlackHole)
-        if device_id.is_none() {
-            device_id = micuse::find_device_by_name(&device_name);
-            if device_id.is_none() {
+        // 找监视目标(支持热插拔/晚装虚拟声卡)
+        if target.is_none() {
+            target = micuse::find_monitor_target(&device_name);
+            if target.is_none() {
                 shared.phase.store(Phase::DeviceMissing as u8, Ordering::Relaxed);
                 sleep_check(&stop, 1000);
                 continue;
             }
         }
 
-        let dev = device_id.unwrap();
+        let dev = target.as_ref().unwrap();
         let device_busy = micuse::device_running_somewhere(dev);
         let other_capturing = match micuse::other_process_capturing(dev) {
             MicUse::InUse => true,
             MicUse::Idle => false,
             MicUse::Unsupported => {
                 shared.phase.store(Phase::Unsupported as u8, Ordering::Relaxed);
-                *shared.error.lock().unwrap() =
-                    Some("自动跟随需要 macOS 14 及以上(Process Objects API),请改用手动模式".into());
+                *shared.error.lock().unwrap() = Some(UNSUPPORTED_MSG.into());
                 return;
             }
         };
-        // 展示口径:待命/抑制期看设备占用,使用中看是否仍有应用在采集
+        // 展示口径:使用中看是否仍有应用在采集;其余阶段两信号同时成立才算"在用"
+        // (设备被桥接/路由长期占用时,单看 device_busy 会常亮误导)
         let in_use_display = if gate.phase == Phase::Active {
             other_capturing
         } else {
-            device_busy
+            device_busy && other_capturing
         };
         shared.local_in_use.store(in_use_display, Ordering::Relaxed);
 
@@ -267,8 +289,9 @@ fn follow_thread(addr: String, device_name: String, stop: Arc<AtomicBool>, share
             if let Some(h) = guard.as_ref() {
                 if !h.is_connected() {
                     *shared.error.lock().unwrap() = h.take_error();
+                    let preempted = h.preempted();
                     guard.take();
-                    gate.on_session_ended();
+                    gate.on_session_ended(preempted);
                 }
             }
         }
@@ -324,7 +347,7 @@ mod tests {
         let mut g = FollowGate::new(2000);
         // 待命:设备空闲不动作
         assert_eq!(g.step(false, false, 0), FollowAction::None);
-        // 本机应用开始用 BlackHole(device_busy)→ 认领
+        // 本机应用开始采集虚拟声卡(设备在跑 + 有进程采集)→ 认领
         assert_eq!(g.step(true, true, 100), FollowAction::Claim);
         assert_eq!(g.phase, Phase::Active);
         // 使用中:应用仍在采集(device_busy 因我们自己播放恒 true,不参与判断)
@@ -335,17 +358,34 @@ mod tests {
         // 期间恢复采集 → 挂起计时清零
         assert_eq!(g.step(true, true, 2800), FollowAction::None);
         assert_eq!(g.step(true, false, 3000), FollowAction::None);
-        // 持续停用超过挂起时长 → 释放,进入抑制态排空
+        // 持续停用超过挂起时长 → 释放,进入排空态
         assert_eq!(g.step(true, false, 5100), FollowAction::Release);
-        assert_eq!(g.phase, Phase::Suppressed);
-        // 我们自己的播放流还没关完(device_busy)→ 继续等
-        assert_eq!(g.step(true, false, 5200), FollowAction::None);
-        assert_eq!(g.phase, Phase::Suppressed);
-        // 设备完全空闲 → 重新武装
-        assert_eq!(g.step(false, false, 5500), FollowAction::None);
+        assert_eq!(g.phase, Phase::Draining);
+        // 采集已停止 → 回到待命;自己播放的余量(device_busy)不再阻塞
+        assert_eq!(g.step(true, false, 5400), FollowAction::None);
         assert_eq!(g.phase, Phase::Armed);
+        // 待命期播放余量只有 IO 没有采集 → 不误认领
+        assert_eq!(g.step(true, false, 5700), FollowAction::None);
         // 再次使用 → 再次认领
         assert_eq!(g.step(true, true, 6000), FollowAction::Claim);
+    }
+
+    /// 设备被第三方长期占用(模拟器麦克风桥接/系统音频路由)但无人采集:
+    /// 不误认领、不卡排空——"重启后自动跟随失灵"的根因回归测试
+    #[test]
+    fn gate_ignores_persistently_busy_device_without_capture() {
+        let mut g = FollowGate::new(2000);
+        // 设备一直忙但没有进程在采集 → 一直待命,不认领
+        assert_eq!(g.step(true, false, 0), FollowAction::None);
+        assert_eq!(g.step(true, false, 10_000), FollowAction::None);
+        assert_eq!(g.phase, Phase::Armed);
+        // 真正的采集出现 → 认领
+        assert_eq!(g.step(true, true, 11_000), FollowAction::Claim);
+        // 采集结束 → 释放;设备仍被占用也能回到待命
+        assert_eq!(g.step(true, false, 12_000), FollowAction::None);
+        assert_eq!(g.step(true, false, 14_100), FollowAction::Release);
+        assert_eq!(g.step(true, false, 14_400), FollowAction::None);
+        assert_eq!(g.phase, Phase::Armed);
     }
 
     #[test]
@@ -353,15 +393,30 @@ mod tests {
         let mut g = FollowGate::new(2000);
         assert_eq!(g.step(true, true, 0), FollowAction::Claim);
         // 被其他设备接管 → 抑制:本机应用仍在采集也不再认领(不拉锯)
-        g.on_session_ended();
+        g.on_session_ended(true);
         assert_eq!(g.phase, Phase::Suppressed);
         assert_eq!(g.step(true, true, 500), FollowAction::None);
         assert_eq!(g.step(true, true, 5000), FollowAction::None);
-        // 本机这轮使用结束、设备空闲 → 重新武装
-        assert_eq!(g.step(false, false, 6000), FollowAction::None);
+        // 本机应用停止采集 → 本轮结束,重新武装(设备被他人占着也不阻塞)
+        assert_eq!(g.step(true, false, 6000), FollowAction::None);
         assert_eq!(g.phase, Phase::Armed);
         // 新一轮本机使用 → 恢复自动认领
         assert_eq!(g.step(true, true, 7000), FollowAction::Claim);
+    }
+
+    #[test]
+    fn gate_drains_when_server_stops_without_preemption() {
+        let mut g = FollowGate::new(2000);
+        assert_eq!(g.step(true, true, 0), FollowAction::Claim);
+        // 服务端主动停止(非被接管)→ 排空,而不是"被接管"抑制
+        g.on_session_ended(false);
+        assert_eq!(g.phase, Phase::Draining);
+        // 本机应用还在采集 → 等本轮结束
+        assert_eq!(g.step(true, true, 500), FollowAction::None);
+        assert_eq!(g.phase, Phase::Draining);
+        // 采集停止 → 重新武装
+        assert_eq!(g.step(true, false, 3000), FollowAction::None);
+        assert_eq!(g.phase, Phase::Armed);
     }
 
     #[test]

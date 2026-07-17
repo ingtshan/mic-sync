@@ -9,6 +9,7 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, StreamTrait};
 
 use crate::audio;
+use crate::settings;
 
 pub const MAGIC: &[u8; 4] = b"MSY1";
 
@@ -16,14 +17,18 @@ pub const MAGIC: &[u8; 4] = b"MSY1";
 pub const END_SERVER_CLOSING: u32 = 0;
 pub const END_PREEMPTED: u32 = 1;
 
+/// 等待用户确认授权的时限。太短会让不在电脑前的人错过请求,
+/// 太长会把对方的客户端吊死在那里——30 秒够按一下弹窗了
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 采集启动器:为一次串流会话按需启动 mic 采集(采集流驻留在自己的线程里,
 /// 停止信号置位后释放麦克风),返回 (实际设备名, 采样率)。
 /// 抽象成函数指针以便测试注入假采集,不依赖真实声卡。
 type CaptureFn = fn(
-    Option<String>,             // 设备偏好
-    Arc<AtomicBool>,            // 本会话采集停止信号
-    SyncSender<Arc<Vec<i16>>>,  // 帧输出
-    Arc<AtomicU32>,             // 电平上报
+    Option<String>,              // 设备偏好
+    Arc<AtomicBool>,             // 本会话采集停止信号
+    SyncSender<Arc<Vec<i16>>>,   // 帧输出
+    Arc<audio::LevelMeter>,      // 电平/波形上报
 ) -> Result<(String, u32), String>;
 
 /// 当前串流会话;同一时间最多一个,新请求会接管(抢占)旧会话
@@ -34,12 +39,33 @@ struct Session {
     end: Arc<AtomicBool>,
 }
 
+/// 用户对一次授权请求的裁决
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decision {
+    /// 只允许这一次,下次再问
+    Once,
+    /// 记住这台设备:签发令牌,以后直接放行
+    Always,
+    Deny,
+}
+
+/// 一个正在等用户确认的授权请求
+struct Pending {
+    id: u64,
+    /// 对方自报的设备名(不可信输入,已过滤控制字符并限长)
+    name: String,
+    addr: SocketAddr,
+    decided: SyncSender<Decision>,
+}
+
 struct Shared {
     /// UI 选择的麦克风设备,下一次采集生效
     device_pref: Mutex<Option<String>>,
     session: Mutex<Option<Session>>,
+    /// 等待用户确认的授权请求;同一时间最多一个
+    pending: Mutex<Option<Pending>>,
     next_id: AtomicU64,
-    level: Arc<AtomicU32>,
+    meter: Arc<audio::LevelMeter>,
     /// 最近一次采集的实际设备名与采样率(状态展示)
     last_device: Mutex<String>,
     last_rate: AtomicU32,
@@ -88,11 +114,33 @@ impl ServerHandle {
     }
 
     pub fn level(&self) -> f32 {
-        audio::decode_level(self.shared.level.load(Ordering::Relaxed))
+        self.shared.meter.level()
+    }
+
+    /// 波形快照:(最近 ~1.5 秒每块音频的峰值序列, 累计块计数),移动端波形 UI 用
+    pub fn wave(&self) -> (Vec<f32>, u64) {
+        self.shared.meter.wave_snapshot()
     }
 
     pub fn take_error(&self) -> Option<String> {
         self.shared.error.lock().unwrap().clone()
+    }
+
+    /// 当前等待用户确认的授权请求 (设备名, 来源地址);None = 没有待确认的
+    pub fn pending(&self) -> Option<(String, String)> {
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| (p.name.clone(), p.addr.to_string()))
+    }
+
+    /// 用户裁决当前的授权请求;没有待确认请求时静默忽略(UI 可能慢一拍)
+    pub fn decide(&self, decision: Decision) {
+        if let Some(p) = self.shared.pending.lock().unwrap().take() {
+            let _ = p.decided.try_send(decision);
+        }
     }
 
     pub fn stop(&self) {
@@ -100,6 +148,10 @@ impl ServerHandle {
         // 让在场会话尽快发结束帧收尾
         if let Some(s) = self.shared.session.lock().unwrap().as_ref() {
             s.end.store(true, Ordering::SeqCst);
+        }
+        // 服务停了就别再吊着等确认的请求
+        if let Some(p) = self.shared.pending.lock().unwrap().take() {
+            let _ = p.decided.try_send(Decision::Deny);
         }
     }
 }
@@ -143,8 +195,9 @@ fn start_with(
     let shared = Arc::new(Shared {
         device_pref: Mutex::new(device_name),
         session: Mutex::new(None),
+        pending: Mutex::new(None),
         next_id: AtomicU64::new(1),
-        level: Arc::new(AtomicU32::new(0)),
+        meter: Arc::new(audio::LevelMeter::new()),
         last_device: Mutex::new(String::new()),
         last_rate: AtomicU32::new(0),
         error: Mutex::new(None),
@@ -217,18 +270,23 @@ fn handle_conn(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>, s
                         .unwrap_or_default(),
                 )
             };
+            // alias/device_type/fingerprint 供客户端子网扫描发现用:
+            // /health 本身就是发现签名,fingerprint 让扫描方认出「这是我自己」
             let body = serde_json::json!({
                 "status": "ok",
                 "app": "micsync",
                 "streaming": streaming,
                 "client": client,
                 "sample_rate": shared.last_rate.load(Ordering::Relaxed),
+                "alias": crate::discovery::alias(),
+                "device_type": crate::discovery::device_type(),
+                "device_id": crate::discovery::device_id(),
             })
             .to_string();
             let _ = write_http(&mut stream, 200, "OK", &body);
             graceful_close(stream);
         }
-        "/stream" => handle_stream(stream, addr, stop, shared),
+        "/stream" => handle_stream(stream, addr, &head, stop, shared),
         _ => {
             let _ = write_http(&mut stream, 404, "Not Found", r#"{"error":"not_found"}"#);
             graceful_close(stream);
@@ -236,7 +294,135 @@ fn handle_conn(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>, s
     }
 }
 
-fn handle_stream(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
+/// 取请求头的值(HTTP 头名大小写不敏感);缺失返回空串
+fn header_value(head: &str, name: &str) -> String {
+    let want = name.to_ascii_lowercase();
+    head.lines()
+        .skip(1) // 跳过请求行
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            (k.trim().to_ascii_lowercase() == want).then(|| v.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// 授权闸门结果
+enum Consent {
+    /// 放行;Some(token) = 用户选了「始终允许」,需把新令牌交给对方
+    Allowed(Option<String>),
+    Denied,
+    Timeout,
+    /// 另一个请求正在等确认——不排队,让对方稍后重试
+    Busy,
+}
+
+/// 授权闸门:已信任的客户端直接放行,否则挂起请求交给用户裁决。
+/// 这一步必须在认领会话与开麦之前——没同意之前不能碰麦克风。
+fn await_consent(shared: &Arc<Shared>, name: &str, addr: SocketAddr, stop: &AtomicBool) -> Consent {
+    let (tx, rx) = sync_channel::<Decision>(1);
+    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut g = shared.pending.lock().unwrap();
+        if g.is_some() {
+            return Consent::Busy;
+        }
+        *g = Some(Pending {
+            id,
+            name: name.to_string(),
+            addr,
+            decided: tx,
+        });
+    }
+
+    // 分段等待:既能到点超时,也能在服务停止时立刻收手
+    let deadline = std::time::Instant::now() + CONSENT_TIMEOUT;
+    let outcome = loop {
+        if stop.load(Ordering::SeqCst) {
+            break None;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break None;
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(200))) {
+            Ok(d) => break Some(d),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            // 发送端被丢弃(如 stop 里 take 走了):当作拒绝
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+        }
+    };
+
+    // 无论结果如何都要摘掉自己的 pending,否则后续请求会一直撞 Busy。
+    // 认 id:decide() 可能已经取走了,别误删别人的
+    {
+        let mut g = shared.pending.lock().unwrap();
+        if g.as_ref().map_or(false, |p| p.id == id) {
+            *g = None;
+        }
+    }
+
+    match outcome {
+        Some(Decision::Once) => Consent::Allowed(None),
+        Some(Decision::Always) => Consent::Allowed(Some(settings::trust_client(name))),
+        Some(Decision::Deny) => Consent::Denied,
+        None => Consent::Timeout,
+    }
+}
+
+fn handle_stream(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    head: &str,
+    stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+) {
+    // 授权闸门:先确认对方有权使用本机麦克风,再谈开麦。
+    // 令牌是服务端签发的私密凭据(不出现在 /health),名字只是展示用的不可信输入
+    let token = header_value(head, "x-micsync-token");
+    let name = settings::sanitize_name(&header_value(head, "x-micsync-name"));
+    let name = if name.is_empty() {
+        format!("未命名设备({})", addr.ip())
+    } else {
+        name
+    };
+
+    let mut issued_token = None;
+    if !settings::trusted_by_token(&token, &name) {
+        match await_consent(&shared, &name, addr, &stop) {
+            Consent::Allowed(t) => issued_token = t,
+            Consent::Denied => {
+                let _ = write_http(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    r#"{"error":"denied","message":"对方拒绝了本次麦克风使用请求"}"#,
+                );
+                graceful_close(stream);
+                return;
+            }
+            Consent::Timeout => {
+                let _ = write_http(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    r#"{"error":"timeout","message":"对方未在时限内确认,请求已取消"}"#,
+                );
+                graceful_close(stream);
+                return;
+            }
+            Consent::Busy => {
+                let _ = write_http(
+                    &mut stream,
+                    409,
+                    "Conflict",
+                    r#"{"error":"busy","message":"另一台设备的请求正在等待确认,请稍后重试"}"#,
+                );
+                graceful_close(stream);
+                return;
+            }
+        }
+    }
+
     // 认领会话(抢占式):新请求接管旧串流——同一个人换设备,最新请求在哪人就在哪
     let (my_id, my_end) = {
         let mut guard = shared.session.lock().unwrap();
@@ -257,7 +443,7 @@ fn handle_stream(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>,
     let cap_stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = sync_channel::<Arc<Vec<i16>>>(64);
     let pref = shared.device_pref.lock().unwrap().clone();
-    let init = (shared.capture)(pref, cap_stop.clone(), tx, shared.level.clone());
+    let init = (shared.capture)(pref, cap_stop.clone(), tx, shared.meter.clone());
 
     let (device, rate) = match init {
         Ok(v) => v,
@@ -276,8 +462,14 @@ fn handle_stream(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>,
     *shared.error.lock().unwrap() = None;
 
     let handshake = (|| -> std::io::Result<()> {
+        // 用户选了「始终允许」时,把签发的令牌随响应头交给对方;
+        // 对方存下来,以后凭它直接放行,不用再打扰用户
+        let token_header = match &issued_token {
+            Some(t) => format!("X-MicSync-Token: {t}\r\n"),
+            None => String::new(),
+        };
         stream.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\n{token_header}Connection: close\r\n\r\n").as_bytes(),
         )?;
         // 二进制流头: MAGIC(4) + sample_rate u32 LE + channels u16 LE + reserved u16
         let mut header = Vec::with_capacity(12);
@@ -292,9 +484,9 @@ fn handle_stream(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>,
         write_frames(&mut stream, rx, &stop, &my_end);
     }
 
-    // 会话收尾:关麦克风、清电平、释放会话(可能已被新会话顶替)
+    // 会话收尾:关麦克风、清电平/波形、释放会话(可能已被新会话顶替)
     cap_stop.store(true, Ordering::SeqCst);
-    shared.level.store(0, Ordering::Relaxed);
+    shared.meter.reset();
     release_session(&shared, my_id);
     // 优雅关闭,确保结束帧(原因码)送达对端后再断
     graceful_close(stream);
@@ -371,12 +563,12 @@ fn real_capture(
     device_pref: Option<String>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<Arc<Vec<i16>>>,
-    level: Arc<AtomicU32>,
+    meter: Arc<audio::LevelMeter>,
 ) -> Result<(String, u32), String> {
     let (init_tx, init_rx) = sync_channel::<Result<(String, u32), String>>(1);
     thread::Builder::new()
         .name("mic-capture".into())
-        .spawn(move || capture_thread(device_pref, stop, tx, level, init_tx))
+        .spawn(move || capture_thread(device_pref, stop, tx, meter, init_tx))
         .map_err(|e| format!("创建采集线程失败: {e}"))?;
     init_rx
         .recv_timeout(Duration::from_secs(5))
@@ -387,7 +579,7 @@ fn capture_thread(
     device_name: Option<String>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<Arc<Vec<i16>>>,
-    level: Arc<AtomicU32>,
+    meter: Arc<audio::LevelMeter>,
     init_tx: SyncSender<Result<(String, u32), String>>,
 ) {
     let device = match audio::find_input_device(device_name.as_deref()) {
@@ -412,7 +604,7 @@ fn capture_thread(
 
     let on_mono = {
         move |mono: Vec<f32>| {
-            level.store(audio::encode_level(audio::peak_level(&mono)), Ordering::Relaxed);
+            meter.push(audio::peak_level(&mono));
             // 队列满(客户端太慢)或会话已收尾都直接丢帧,由停止信号结束本线程
             let _ = tx.try_send(Arc::new(audio::f32_to_i16(&mono)));
         }
@@ -544,7 +736,7 @@ mod tests {
         _pref: Option<String>,
         stop: Arc<AtomicBool>,
         tx: SyncSender<Arc<Vec<i16>>>,
-        level: Arc<AtomicU32>,
+        meter: Arc<audio::LevelMeter>,
     ) -> Result<(String, u32), String> {
         ACTIVE_CAPTURES.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
@@ -557,7 +749,7 @@ mod tests {
                         (s * i16::MAX as f32) as i16
                     })
                     .collect();
-                level.store(500, Ordering::Relaxed);
+                meter.push(0.5);
                 let _ = tx.try_send(Arc::new(frame));
                 thread::sleep(Duration::from_millis(10));
             }
@@ -570,27 +762,42 @@ mod tests {
         _pref: Option<String>,
         _stop: Arc<AtomicBool>,
         _tx: SyncSender<Arc<Vec<i16>>>,
-        _level: Arc<AtomicU32>,
+        _meter: Arc<audio::LevelMeter>,
     ) -> Result<(String, u32), String> {
         Err("假装麦克风坏了".into())
     }
 
-    fn http_get(port: u16, path: &str) -> TcpStream {
+    fn http_get_with(port: u16, path: &str, extra: &str) -> TcpStream {
         let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        // 放宽超时:并行套件冷启动时 CPU 争抢可能让响应偶发超过 2s
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // 放宽超时:整套并行跑(尤其机器上还有别的构建)时 CPU 争抢厉害,
+        // 5s 实测会偶发不够——这里等的是本地回环,宁可给足也不要假失败
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         s.write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes(),
+            format!("GET {path} HTTP/1.1\r\nHost: t\r\n{extra}Connection: close\r\n\r\n")
+                .as_bytes(),
         )
         .expect("write req");
         s
+    }
+
+    fn http_get(port: u16, path: &str) -> TcpStream {
+        http_get_with(port, path, "")
+    }
+
+    /// 带已授权令牌的请求:跳过确认闸门,用于测试串流本身的逻辑。
+    /// 单测里 settings 全程在内存中(没有 CONFIG_PATH),不会污染真实配置
+    fn http_get_trusted(port: u16, path: &str) -> TcpStream {
+        let token = settings::trust_client("测试设备");
+        http_get_with(port, path, &format!("X-MicSync-Token: {token}\r\n"))
     }
 
     fn read_test_head(stream: &mut TcpStream) -> String {
         let mut buf = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            stream.read_exact(&mut byte).expect("read head");
+            stream
+                .read_exact(&mut byte)
+                .unwrap_or_else(|e| panic!("读响应头失败({e:?});已读到 {:?}", String::from_utf8_lossy(&buf)));
             buf.push(byte[0]);
             if buf.ends_with(b"\r\n\r\n") {
                 break;
@@ -658,7 +865,7 @@ mod tests {
         assert!(resp.contains(r#""streaming":false"#), "{resp}");
 
         // 第一个客户端请求 → 自动开麦并串流
-        let mut c1 = http_get(port, "/stream");
+        let mut c1 = http_get_trusted(port, "/stream");
         let head1 = read_test_head(&mut c1);
         assert!(head1.starts_with("HTTP/1.1 200"), "{head1}");
         let mut magic = [0u8; 12];
@@ -679,7 +886,7 @@ mod tests {
         assert!(resp.contains(r#""streaming":true"#), "{resp}");
 
         // 第二个客户端请求 → 接管:c1 收到被抢占的结束帧,c2 正常收流
-        let mut c2 = http_get(port, "/stream");
+        let mut c2 = http_get_trusted(port, "/stream");
         let head2 = read_test_head(&mut c2);
         assert!(head2.starts_with("HTTP/1.1 200"), "{head2}");
         let mut magic2 = [0u8; 12];
@@ -721,7 +928,7 @@ mod tests {
     fn server_stop_notifies_client() {
         let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let handle = start_with(None, 0, fake_capture).expect("start");
-        let mut c1 = http_get(handle.port, "/stream");
+        let mut c1 = http_get_trusted(handle.port, "/stream");
         let head = read_test_head(&mut c1);
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         let mut magic = [0u8; 12];
@@ -746,7 +953,7 @@ mod tests {
     #[test]
     fn mic_failure_returns_503() {
         let handle = start_with(None, 0, failing_capture).expect("start");
-        let mut c1 = http_get(handle.port, "/stream");
+        let mut c1 = http_get_trusted(handle.port, "/stream");
         let head = read_test_head(&mut c1);
         assert!(head.starts_with("HTTP/1.1 503"), "{head}");
         let mut body = String::new();
@@ -759,5 +966,199 @@ mod tests {
         c.read_to_string(&mut resp).expect("health");
         assert!(resp.contains(r#""streaming":false"#), "{resp}");
         handle.stop();
+    }
+    // ---------- 授权闸门 ----------
+
+    fn read_status(stream: &mut TcpStream) -> u16 {
+        let head = read_test_head(stream);
+        head.lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .expect("status line")
+    }
+
+    /// 等到出现待确认请求;超时返回 None
+    fn wait_pending(h: &ServerHandle, ms: u64) -> Option<(String, String)> {
+        let mut waited = 0;
+        while waited < ms {
+            if let Some(p) = h.pending() {
+                return Some(p);
+            }
+            thread::sleep(Duration::from_millis(20));
+            waited += 20;
+        }
+        h.pending()
+    }
+
+    /// 核心安全属性:没点同意之前,麦克风一下都不能开
+    #[test]
+    fn unauthorized_request_does_not_open_mic_until_approved() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let port = handle.port;
+
+        let mut c = http_get_with(port, "/stream", "X-MicSync-Name: 张三的 Mac\r\n");
+        let pending = wait_pending(&handle, 2000).expect("应出现待确认请求");
+        assert_eq!(pending.0, "张三的 Mac", "弹窗要显示对方设备名");
+
+        // 关键:挂起期间麦克风必须是关的
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            ACTIVE_CAPTURES.load(Ordering::SeqCst),
+            0,
+            "未经同意绝不能开麦"
+        );
+        assert!(handle.stream_addr().is_none(), "未经同意不能占用会话");
+
+        handle.decide(Decision::Deny);
+        assert_eq!(read_status(&mut c), 403, "拒绝应返回 403");
+        assert_eq!(ACTIVE_CAPTURES.load(Ordering::SeqCst), 0, "拒绝后仍不开麦");
+        handle.stop();
+    }
+
+    /// 「允许一次」放行本次,但不留信任——下次还得再问
+    #[test]
+    fn allow_once_streams_but_is_not_remembered() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let port = handle.port;
+
+        let mut c = http_get_with(port, "/stream", "X-MicSync-Name: 一次性设备\r\n");
+        wait_pending(&handle, 2000).expect("应出现待确认请求");
+        handle.decide(Decision::Once);
+
+        let head = read_test_head(&mut c);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("x-micsync-token"),
+            "「允许一次」不该签发令牌:{head}"
+        );
+        let mut magic = [0u8; 12];
+        c.read_exact(&mut magic).expect("MSY1 header");
+        assert_eq!(&magic[0..4], MAGIC);
+        drop(c);
+
+        // 同一台设备再来:因为没被记住,应再次进入待确认
+        let _c2 = http_get_with(port, "/stream", "X-MicSync-Name: 一次性设备\r\n");
+        assert!(
+            wait_pending(&handle, 2000).is_some(),
+            "「允许一次」之后应重新确认"
+        );
+        handle.stop();
+    }
+
+    /// 「始终允许」签发令牌;之后凭令牌直接放行,不再打扰用户
+    #[test]
+    fn allow_always_issues_token_that_skips_the_prompt() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let port = handle.port;
+
+        let mut c = http_get_with(port, "/stream", "X-MicSync-Name: 我的 iPhone\r\n");
+        wait_pending(&handle, 2000).expect("应出现待确认请求");
+        handle.decide(Decision::Always);
+
+        let head = read_test_head(&mut c);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let token = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("x-micsync-token")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("「始终允许」应随响应签发令牌");
+        assert!(!token.is_empty());
+        drop(c);
+
+        // 凭令牌重来:不该再出现待确认,直接串流
+        let mut c2 = http_get_with(port, "/stream", &format!("X-MicSync-Token: {token}\r\n"));
+        let head2 = read_test_head(&mut c2);
+        assert!(head2.starts_with("HTTP/1.1 200"), "{head2}");
+        assert!(handle.pending().is_none(), "已授权设备不该再弹确认");
+
+        // 撤销之后应恢复到需要确认
+        settings::revoke_trusted(&token);
+        drop(c2);
+        let _c3 = http_get_with(port, "/stream", &format!("X-MicSync-Token: {token}\r\n"));
+        assert!(
+            wait_pending(&handle, 2000).is_some(),
+            "撤销授权后应重新确认"
+        );
+        handle.stop();
+    }
+
+    /// 伪造/过期令牌不能蒙混过关,得走确认
+    #[test]
+    fn bogus_token_still_needs_approval() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let _c = http_get_with(
+            handle.port,
+            "/stream",
+            "X-MicSync-Token: deadbeefdeadbeef\r\nX-MicSync-Name: 冒充者\r\n",
+        );
+        assert!(
+            wait_pending(&handle, 2000).is_some(),
+            "未知令牌必须走确认流程"
+        );
+        assert_eq!(ACTIVE_CAPTURES.load(Ordering::SeqCst), 0, "期间不开麦");
+        handle.stop();
+    }
+
+    /// 已有请求等确认时,第二个请求得到 409 而不是排队把人吊死
+    #[test]
+    fn second_request_while_pending_gets_conflict() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let port = handle.port;
+
+        let _c1 = http_get_with(port, "/stream", "X-MicSync-Name: 甲\r\n");
+        wait_pending(&handle, 2000).expect("第一个请求应挂起");
+
+        let mut c2 = http_get_with(port, "/stream", "X-MicSync-Name: 乙\r\n");
+        assert_eq!(read_status(&mut c2), 409, "并发的第二个请求应得 409");
+        handle.stop();
+    }
+
+    /// 设备名是对方给的不可信输入:换行会破坏 HTTP 头,超长会撑破弹窗
+    #[test]
+    fn hostile_device_name_is_sanitized() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        // 名字里塞控制字符与超长内容
+        let _c = http_get_with(
+            handle.port,
+            "/stream",
+            "X-MicSync-Name: 坏\u{7}设备\r\n",
+        );
+        let (name, _) = wait_pending(&handle, 2000).expect("应出现待确认请求");
+        assert!(!name.contains('\u{7}'), "控制字符应被滤掉: {name:?}");
+        assert!(name.chars().count() <= 40, "名字应限长");
+        handle.stop();
+    }
+
+    /// 没报名字的请求也要能显示来源,否则用户不知道在给谁授权
+    #[test]
+    fn nameless_request_falls_back_to_address() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let _c = http_get(handle.port, "/stream");
+        let (name, addr) = wait_pending(&handle, 2000).expect("应出现待确认请求");
+        assert!(name.contains("未命名设备"), "got {name}");
+        assert!(addr.starts_with("127.0.0.1:"), "got {addr}");
+        handle.stop();
+    }
+
+    #[test]
+    fn header_value_is_case_insensitive_and_trims() {
+        let head = "GET /stream HTTP/1.1\r\nHost: t\r\nX-MicSync-Name:  我的 Mac \r\n\r\n";
+        assert_eq!(header_value(head, "x-micsync-name"), "我的 Mac");
+        assert_eq!(header_value(head, "X-MicSync-Name"), "我的 Mac");
+        assert_eq!(header_value(head, "x-micsync-token"), "");
+        // 请求行里的冒号不该被当成头
+        assert_eq!(header_value(head, "GET /stream HTTP/1.1"), "");
     }
 }

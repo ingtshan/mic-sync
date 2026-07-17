@@ -10,6 +10,7 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, StreamTrait};
 
 use crate::audio;
+use crate::settings;
 use crate::server::{END_PREEMPTED, MAGIC};
 
 /// 收流缓冲上限(毫秒)——超过则丢最老的数据,防止延迟无限增长
@@ -21,19 +22,24 @@ const RETRY_LOST_MS: u64 = 800;
 /// 服务端不可达时的重试间隔(毫秒)
 const RETRY_OFFLINE_MS: u64 = 1500;
 
-/// 客户端运行模式:连接/重连中 / 正在收流 / 已结束(被接管或服务端停止)
+/// 客户端运行模式:连接/重连中 / 等待对方确认授权 / 正在收流 /
+/// 已结束(被接管或服务端停止) / 被拒绝(终态,不再重试)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
     Connecting = 0,
+    Waiting = 1,
     Streaming = 2,
     Ended = 3,
+    Denied = 4,
 }
 
 impl Mode {
     fn from_u8(v: u8) -> Mode {
         match v {
+            1 => Mode::Waiting,
             2 => Mode::Streaming,
             3 => Mode::Ended,
+            4 => Mode::Denied,
             _ => Mode::Connecting,
         }
     }
@@ -41,10 +47,29 @@ impl Mode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Mode::Connecting => "connecting",
+            Mode::Waiting => "waiting",
             Mode::Streaming => "streaming",
             Mode::Ended => "ended",
+            Mode::Denied => "denied",
         }
     }
+}
+
+/// 认领 /stream 的失败原因——决定要不要重试。
+/// 分清这个很重要:被拒绝还不停重试 = 每 1.5 秒骚扰对方一次
+enum OpenErr {
+    /// 对方拒绝或未在时限内确认:终态,等用户重新发起,绝不自动重试
+    Denied(String),
+    /// 网络不可达、开麦失败等:可以重试
+    Retry(String),
+}
+
+/// 对端服务端的公开身份(发起使用时从 /health 取)
+struct ServerIdent {
+    /// 公开 device_id;空 = 旧版服务端,记不住授权
+    id: String,
+    /// 设备名,用于「等待 X 确认」这类提示
+    name: String,
 }
 
 /// 一轮串流会话的结束方式
@@ -67,6 +92,8 @@ struct Shared {
     buffer: Mutex<VecDeque<f32>>,
     /// 起播状态:false 时静音蓄水
     started: AtomicBool,
+    /// 本轮以「被其他设备接管」结束(区别于服务端主动停止)
+    preempted: AtomicBool,
     error: Mutex<Option<String>>,
 }
 
@@ -108,6 +135,11 @@ impl ClientHandle {
         self.shared.error.lock().unwrap().clone()
     }
 
+    /// 本轮是否因被其他设备接管而结束
+    pub fn preempted(&self) -> bool {
+        self.shared.preempted.load(Ordering::Relaxed)
+    }
+
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -135,8 +167,12 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
         .next()
         .ok_or_else(|| format!("地址无法解析: {full_addr}"))?;
 
-    // 立即校验对方是 MicSync 服务端,失败直接报错给用户
-    fetch_health(&sock_addr, &full_addr, Duration::from_secs(3))?;
+    // 立即校验对方是 MicSync 服务端,并取回其公开身份(用于匹配授权令牌)
+    let (server_id, server_name) = fetch_health(&sock_addr, &full_addr, Duration::from_secs(3))?;
+    let server = ServerIdent {
+        id: server_id,
+        name: server_name,
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
@@ -146,6 +182,7 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
         level: AtomicU32::new(0),
         buffer: Mutex::new(VecDeque::new()),
         started: AtomicBool::new(false),
+        preempted: AtomicBool::new(false),
         error: Mutex::new(None),
     });
 
@@ -175,7 +212,7 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
         let host = full_addr.clone();
         thread::Builder::new()
             .name("mic-claim".into())
-            .spawn(move || claim_thread(sock_addr, host, stop, shared))
+            .spawn(move || claim_thread(sock_addr, host, server, stop, shared))
             .map_err(|e| format!("创建认领线程失败: {e}"))?;
     }
 
@@ -187,10 +224,26 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
     })
 }
 
-fn claim_thread(sock_addr: SocketAddr, host: String, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
+fn claim_thread(
+    sock_addr: SocketAddr,
+    host: String,
+    server: ServerIdent,
+    stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+) {
     while !stop.load(Ordering::SeqCst) {
-        match open_stream(&sock_addr, &host) {
-            Ok((stream, src_rate)) => {
+        // 没有令牌 = 对方还没授权过本机,这次请求要等人点确认
+        let token = settings::token_for_server(&server.id).unwrap_or_default();
+        if token.is_empty() {
+            shared.mode.store(Mode::Waiting as u8, Ordering::Relaxed);
+            *shared.error.lock().unwrap() = Some(format!("等待「{}」确认授权…", server.name));
+        }
+        match open_stream(&sock_addr, &host, &token) {
+            Ok((stream, src_rate, new_token)) => {
+                // 对方选了「始终允许」:记下令牌,以后不再打扰他
+                if let Some(t) = new_token {
+                    settings::remember_server(&server.id, &t, &server.name);
+                }
                 shared.src_rate.store(src_rate, Ordering::Relaxed);
                 *shared.error.lock().unwrap() = None;
                 shared.mode.store(Mode::Streaming as u8, Ordering::Relaxed);
@@ -198,6 +251,7 @@ fn claim_thread(sock_addr: SocketAddr, host: String, stop: Arc<AtomicBool>, shar
                     StreamEnd::Graceful(reason) => {
                         // 服务端明确结束:不自动重连,等用户重新发起
                         let msg = if reason == END_PREEMPTED {
+                            shared.preempted.store(true, Ordering::Relaxed);
                             "麦克风已被其他设备接管,本机已停止使用"
                         } else {
                             "服务端已停止共享"
@@ -215,7 +269,14 @@ fn claim_thread(sock_addr: SocketAddr, host: String, stop: Arc<AtomicBool>, shar
                     }
                 }
             }
-            Err(e) => {
+            // 对方拒绝/未确认:终态。绝不自动重试——那等于每 1.5 秒再弹一次窗骚扰他
+            Err(OpenErr::Denied(msg)) => {
+                *shared.error.lock().unwrap() = Some(msg);
+                shared.mode.store(Mode::Denied as u8, Ordering::Relaxed);
+                stop.store(true, Ordering::SeqCst);
+                return;
+            }
+            Err(OpenErr::Retry(e)) => {
                 shared.mode.store(Mode::Connecting as u8, Ordering::Relaxed);
                 *shared.error.lock().unwrap() = Some(format!("服务端不可达,自动重试中: {e}"));
                 sleep_check(&stop, RETRY_OFFLINE_MS);
@@ -234,8 +295,13 @@ fn sleep_check(stop: &AtomicBool, ms: u64) {
     }
 }
 
-/// GET /health:确认对方是 MicSync 服务端(仅在发起使用时校验一次)
-fn fetch_health(sock_addr: &SocketAddr, host: &str, timeout: Duration) -> Result<(), String> {
+/// GET /health:确认对方是 MicSync 服务端,并取回它的公开身份 (device_id, 设备名)。
+/// device_id 用来找出本机在该服务端上的授权令牌——公开可读,不是凭据
+fn fetch_health(
+    sock_addr: &SocketAddr,
+    host: &str,
+    timeout: Duration,
+) -> Result<(String, String), String> {
     let mut stream =
         TcpStream::connect_timeout(sock_addr, timeout).map_err(|e| format!("连接失败: {e}"))?;
     let _ = stream.set_nodelay(true);
@@ -263,7 +329,18 @@ fn fetch_health(sock_addr: &SocketAddr, host: &str, timeout: Duration) -> Result
     if v.get("app").and_then(|x| x.as_str()) != Some("micsync") {
         return Err("对方不是 MicSync 服务端".into());
     }
-    Ok(())
+    // 0.5.0 之前的服务端没有这两个字段:仍可连(会走一次授权确认),只是记不住
+    let id = v
+        .get("device_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let name = v
+        .get("alias")
+        .and_then(|x| x.as_str())
+        .unwrap_or("MicSync")
+        .to_string();
+    Ok((id, name))
 }
 
 /// 拆 HTTP 响应:返回 (状态码, body)
@@ -283,38 +360,55 @@ fn split_http_response(resp: &str) -> Result<(u16, &str), String> {
     Ok((code, body))
 }
 
-/// GET /stream:请求使用麦克风(服务端据此按需开麦,新请求接管旧串流)
-fn open_stream(sock_addr: &SocketAddr, host: &str) -> Result<(TcpStream, u32), String> {
+/// GET /stream:请求使用麦克风(服务端据此按需开麦,新请求接管旧串流)。
+/// 带上本机设备名与令牌:未授权时服务端会挂起请求等对方确认,故读超时要盖过确认时限。
+/// 返回 (流, 采样率, 服务端新签发的令牌)
+fn open_stream(
+    sock_addr: &SocketAddr,
+    host: &str,
+    token: &str,
+) -> Result<(TcpStream, u32, Option<String>), OpenErr> {
     let mut stream = TcpStream::connect_timeout(sock_addr, Duration::from_secs(2))
-        .map_err(|e| format!("连接失败: {e}"))?;
+        .map_err(|e| OpenErr::Retry(format!("连接失败: {e}")))?;
     let _ = stream.set_nodelay(true);
-    // 服务端开麦最长约 5 秒,读超时给足余量
+    // 对方可能要等用户点确认(最长 30 秒),再加开麦约 5 秒——读超时必须盖过这段,
+    // 否则我们会先超时断开,让对方点了确认却发现请求已经没了
     stream
-        .set_read_timeout(Some(Duration::from_secs(8)))
-        .map_err(|e| format!("设置超时失败: {e}"))?;
+        .set_read_timeout(Some(Duration::from_secs(40)))
+        .map_err(|e| OpenErr::Retry(format!("设置超时失败: {e}")))?;
 
+    // 设备名让对方知道是谁在请求;令牌是对方之前签发给本机的放行凭据(可能没有)
+    let name = settings::device_name();
+    let token_header = if token.is_empty() {
+        String::new()
+    } else {
+        format!("X-MicSync-Token: {token}\r\n")
+    };
     stream
         .write_all(
-            format!("GET /stream HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+            format!(
+                "GET /stream HTTP/1.1\r\nHost: {host}\r\nX-MicSync-Name: {name}\r\n{token_header}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
-        .map_err(|e| format!("发送请求失败: {e}"))?;
+        .map_err(|e| OpenErr::Retry(format!("发送请求失败: {e}")))?;
 
     // 逐字节读响应头(空行之后即二进制音频流,不能多读)
     let mut head = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     loop {
         if head.len() >= 8192 {
-            return Err("串流响应头过长".into());
+            return Err(OpenErr::Retry("串流响应头过长".into()));
         }
         match stream.read(&mut byte) {
-            Ok(0) => return Err("串流握手被中断".into()),
+            Ok(0) => return Err(OpenErr::Retry("串流握手被中断".into())),
             Ok(_) => {
                 head.push(byte[0]);
                 if head.ends_with(b"\r\n\r\n") {
                     break;
                 }
             }
-            Err(e) => return Err(format!("读取串流响应失败: {e}")),
+            Err(e) => return Err(OpenErr::Retry(format!("读取串流响应失败: {e}"))),
         }
     }
     let head = String::from_utf8_lossy(&head);
@@ -323,31 +417,48 @@ fn open_stream(sock_addr: &SocketAddr, host: &str) -> Result<(TcpStream, u32), S
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
-        .ok_or_else(|| "串流响应状态行异常".to_string())?;
+        .ok_or_else(|| OpenErr::Retry("串流响应状态行异常".into()))?;
     if code != 200 {
-        // 带上服务端给的原因(如 503 开麦失败)
+        // 带上服务端给的原因(如 503 开麦失败、403 对方拒绝)
         let mut body = String::new();
         let _ = stream.read_to_string(&mut body);
         let msg = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
             .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
             .unwrap_or_else(|| format!("HTTP {code}"));
-        return Err(format!("服务端拒绝串流: {msg}"));
+        // 403 = 对方拒绝或没在时限内确认。这是人的决定,不是网络故障——
+        // 自动重试只会每隔一秒半再弹一次窗骚扰对方
+        return Err(match code {
+            403 => OpenErr::Denied(msg),
+            _ => OpenErr::Retry(format!("服务端拒绝串流: {msg}")),
+        });
     }
+
+    // 「始终允许」时对方会随响应签发令牌,存下来以后免确认
+    let new_token = head
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            (k.trim().eq_ignore_ascii_case("x-micsync-token")).then(|| v.trim().to_string())
+        })
+        .filter(|t| !t.is_empty());
 
     // 读二进制流头并校验
     let mut header = [0u8; 12];
     stream
         .read_exact(&mut header)
-        .map_err(|e| format!("读取串流头失败: {e}"))?;
+        .map_err(|e| OpenErr::Retry(format!("读取串流头失败: {e}")))?;
     if &header[0..4] != MAGIC {
-        return Err("对方不是 MicSync 服务端(协议头不匹配)".into());
+        return Err(OpenErr::Retry(
+            "对方不是 MicSync 服务端(协议头不匹配)".into(),
+        ));
     }
     let src_rate = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     if !(8000..=192_000).contains(&src_rate) {
-        return Err(format!("服务端采样率异常: {src_rate}"));
+        return Err(OpenErr::Retry(format!("服务端采样率异常: {src_rate}")));
     }
-    Ok((stream, src_rate))
+    Ok((stream, src_rate, new_token))
 }
 
 /// 一轮串流会话:读帧 → 重采样 → 进抖动缓冲,直到会话结束
@@ -588,16 +699,29 @@ mod tests {
             level: AtomicU32::new(0),
             buffer: Mutex::new(VecDeque::new()),
             started: AtomicBool::new(false),
+            preempted: AtomicBool::new(false),
             error: Mutex::new(None),
         })
     }
 
+    /// 起认领线程。默认伪装成「已获授权」(本机存有该服务端的令牌),
+    /// 这些用例验的是串流本身,不是授权闸门
     fn spawn_claimer(addr: SocketAddr, shared: &Arc<Shared>) -> Arc<AtomicBool> {
+        let server_id = format!("test-server-{}", addr.port());
+        settings::remember_server(&server_id, "test-token", "测试服务端");
+        spawn_claimer_as(addr, shared, &server_id)
+    }
+
+    fn spawn_claimer_as(addr: SocketAddr, shared: &Arc<Shared>, server_id: &str) -> Arc<AtomicBool> {
         let stop = Arc::new(AtomicBool::new(false));
+        let server = ServerIdent {
+            id: server_id.to_string(),
+            name: "测试服务端".into(),
+        };
         {
             let stop = stop.clone();
             let shared = shared.clone();
-            thread::spawn(move || claim_thread(addr, addr.to_string(), stop, shared));
+            thread::spawn(move || claim_thread(addr, addr.to_string(), server, stop, shared));
         }
         stop
     }
@@ -753,6 +877,7 @@ mod tests {
         assert!(stop.load(Ordering::SeqCst), "claimer should stop itself");
         let err = shared.error.lock().unwrap().clone().unwrap_or_default();
         assert!(err.contains("接管"), "error should mention takeover: {err}");
+        assert!(shared.preempted.load(Ordering::Relaxed), "preempted flag should be set");
         // 结束后不再发起新的认领
         let claimed = claims.load(Ordering::SeqCst);
         thread::sleep(Duration::from_millis(600));
@@ -769,6 +894,10 @@ mod tests {
         thread::sleep(Duration::from_millis(600));
         assert_eq!(mode_of(&shared), Mode::Ended);
         assert!(stop.load(Ordering::SeqCst));
+        assert!(
+            !shared.preempted.load(Ordering::Relaxed),
+            "server close is not a preemption"
+        );
     }
 
     /// 网络中断(无结束帧):自动重连,再次认领
@@ -832,5 +961,58 @@ mod tests {
         handle.stop();
         thread::sleep(Duration::from_millis(300));
         assert!(!handle.is_connected(), "stop() should disconnect");
+    }
+    /// 被拒绝是人的决定,不是网络故障:必须停在终态。
+    /// 若走重试逻辑,对方会每 1.5 秒被弹一次窗——比没有授权还糟
+    #[test]
+    fn denied_is_terminal_and_does_not_retry() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        {
+            let hits = hits.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut s) = stream else { continue };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = read_req(&mut s);
+                    let body = r#"{"error":"denied","message":"对方拒绝了本次麦克风使用请求"}"#;
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+
+        let shared = test_shared(48000);
+        let stop = spawn_claimer_as(addr, &shared, "unknown-server");
+        // 给足够时间:若会重试,RETRY_OFFLINE_MS(1.5s)内必然打出第二次请求
+        thread::sleep(Duration::from_millis(2500));
+
+        assert_eq!(mode_of(&shared), Mode::Denied, "被拒绝应停在 denied 终态");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "被拒绝后绝不能重试骚扰对方");
+        assert!(stop.load(Ordering::SeqCst), "认领线程应已自行收手");
+        let err = shared.error.lock().unwrap().clone().unwrap_or_default();
+        assert!(err.contains("拒绝"), "应把对方给的原因带给用户: {err}");
+    }
+
+    /// 服务端不可达属于网络故障,这条路仍应重试(别把重试逻辑一起改坏了)
+    #[test]
+    fn unreachable_server_still_retries() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // 端口无人监听
+
+        let shared = test_shared(48000);
+        let stop = spawn_claimer_as(addr, &shared, "unknown-server");
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(mode_of(&shared), Mode::Connecting, "不可达应保持重连态");
+        assert!(!stop.load(Ordering::SeqCst), "不该自行收手");
+        stop.store(true, Ordering::SeqCst);
     }
 }

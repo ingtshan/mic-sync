@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bundle-path: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+          - os: windows-latest
+            bundle-path: |
+              src-tauri/target/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 预编译二进制安装 tauri-cli,比 cargo install 快一个数量级
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install tauri-cli
+        run: cargo binstall "tauri-cli@^2" --no-confirm
+
+      - name: Build
+        run: cargo tauri build
+        working-directory: src-tauri
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: micsync-${{ runner.os }}
+          path: ${{ matrix.bundle-path }}
+          if-no-files-found: error

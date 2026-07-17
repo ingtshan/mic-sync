@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 与网页版 style.css 的 :root 调色板一致 -->
+<resources>
+    <color name="ic_launcher_background">#1E88E5</color>
+    <color name="bg">#0F1117</color>
+    <color name="card">#1A1D27</color>
+    <color name="card_border">#2A2E3D</color>
+    <color name="text">#E8EAF0</color>
+    <color name="text_dim">#8B90A0</color>
+    <color name="accent">#5B8CFF</color>
+    <color name="green">#3DDC84</color>
+    <color name="red">#FF5B5B</color>
+</resources>

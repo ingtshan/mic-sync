@@ -1,18 +1,50 @@
 [package]
 name = "mic-sync"
-version = "0.4.0"
+version = "0.5.0"
 description = "Share one physical microphone across multiple Macs over LAN"
 edition = "2021"
+
+[lib]
+# Tauri 移动端要求 App 主体是共享库;桌面端二进制(main.rs)薄封装调用它
+name = "mic_sync_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon: macOS 菜单栏托盘(桌面端专属,移动端构建自动忽略)
+# image-png: 解码托盘的模板图标 icons/tray.png
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 cpal = "0.16"
 local-ip-address = "0.6"
+# 服务发现拿主机名当展示名(跨平台包装 gethostname 系统调用)
+gethostname = "1"
+
+# 桌面端:单实例守护——重复启动(如关窗后台驻留时再次打开另一份 .app)
+# 只唤回已有窗口,避免两个实例的自动跟随互相抢占麦克风
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+# iOS: cpal 只管 AudioUnit,AVAudioSession 类别/激活/录音权限要 App 自己配
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+block2 = "0.6"
+
+# Windows: micuse 用 WASAPI 会话枚举检测 VB-Cable 采集端的使用状态
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
 
 [profile.release]
 strip = true
