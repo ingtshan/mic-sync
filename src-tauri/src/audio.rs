@@ -55,6 +55,11 @@ pub fn find_output_device(name: Option<&str>) -> Option<cpal::Device> {
     host.default_output_device()
 }
 
+/// 解析输出设备名:None 时优先 BlackHole,其次系统默认(自动跟随用它确定检测目标)
+pub fn resolve_output_name(name: Option<&str>) -> Option<String> {
+    find_output_device(name).and_then(|d| d.name().ok())
+}
+
 /// 交错多声道 → 单声道(取各声道平均)
 pub fn interleaved_to_mono_f32(data: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {

@@ -23,31 +23,32 @@
   <!-- ============ 服务端面板 ============ -->
   <main id="panel-server" class="panel">
     <section class="card">
-      <label class="field-label" for="input-device">麦克风设备</label>
+      <label class="field-label" for="input-device">共享的麦克风设备(更换对下一次使用生效)</label>
       <select id="input-device"></select>
 
-      <label class="field-label" for="server-port">监听端口</label>
+      <label class="field-label" for="server-port">监听端口(暂停服务后可改)</label>
       <input id="server-port" type="number" value="47800" min="1024" max="65535" />
 
-      <button id="btn-server-toggle" class="btn primary">▶ 启动共享</button>
+      <button id="btn-server-toggle" class="btn primary">⏸ 暂停服务</button>
+      <p class="hint">应用启动后自动在局域网监听,无需手动开启。平时完全不收音——只有客户端请求使用时才会打开麦克风,对方停止即关闭。</p>
     </section>
 
     <section id="server-info" class="card hidden">
       <div class="status-row">
         <span class="dot green"></span>
-        <span id="server-summary">运行中</span>
+        <span id="server-summary">服务运行中</span>
+      </div>
+      <div class="status-row">
+        <span id="stream-dot" class="dot gray"></span>
+        <span id="server-stream">麦克风空闲 · 无客户端使用</span>
       </div>
       <div class="level-wrap">
         <div class="level-label">输入电平</div>
         <div class="level-bar"><div id="server-level" class="level-fill"></div></div>
       </div>
       <div class="info-grid">
-        <div><span class="k">麦克风状态</span><span id="server-mic" class="v">静音待机</span></div>
+        <div><span class="k">共享设备</span><span id="server-device" class="v">系统默认</span></div>
         <div><span class="k">采样率</span><span id="server-rate" class="v">—</span></div>
-      </div>
-      <div class="status-row">
-        <span id="stream-dot" class="dot gray"></span>
-        <span id="server-stream">串流空闲 · 等待客户端认领</span>
       </div>
       <div class="ip-section">
         <div class="k">客户端连接地址(本机 IP)</div>
@@ -77,8 +78,9 @@
       <label class="field-label" for="output-device">输出到(选 BlackHole 即虚拟麦克风)</label>
       <select id="output-device"></select>
 
-      <button id="btn-client-toggle" class="btn primary">👂 开始监听</button>
-      <p class="hint">开始监听后不会持续占用带宽:只有服务端麦克风有人说话时才自动拉取音频,说完自动回到待机。</p>
+      <button id="btn-follow-toggle" class="btn primary">⚡ 自动跟随本机应用</button>
+      <button id="btn-client-toggle" class="btn">🎙 手动使用这个麦克风</button>
+      <p class="hint">「自动跟随」:检测到本机有应用把 BlackHole 当麦克风采集(如进入会议)时,自动向服务端请求麦克风;应用停止采集约 2 秒后自动释放、远端关麦——全程无需手动点击(需 macOS 14+)。「手动使用」则立即请求、手动停止。两种模式下,另一台设备发起请求都会自动接管,本机随之停止——人在哪台设备,麦克风就跟到哪台。</p>
     </section>
 
     <section id="client-info" class="card hidden">
@@ -100,7 +102,7 @@
     <p id="client-error" class="error hidden"></p>
   </main>
 
-  <footer class="app-footer">局域网低延迟传输 · 语音激活按需串流 · PCM 16bit 单声道</footer>
+  <footer class="app-footer">局域网低延迟传输 · 按需开麦零常驻 · PCM 16bit 单声道</footer>
 
   <script src="main.js"></script>
 </body>

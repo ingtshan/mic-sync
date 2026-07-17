@@ -10,46 +10,56 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, StreamTrait};
 
 use crate::audio;
-use crate::server::MAGIC;
+use crate::server::{END_PREEMPTED, MAGIC};
 
 /// 收流缓冲上限(毫秒)——超过则丢最老的数据,防止延迟无限增长
 const MAX_BUFFER_MS: usize = 300;
 /// 起播水位(毫秒)——攒够这些数据才开始出声,吸收网络抖动
 const PREBUFFER_MS: usize = 60;
-/// 待机时 /health 轮询间隔(毫秒)
-const POLL_STANDBY_MS: u64 = 250;
+/// 连接中断后的重连间隔(毫秒)
+const RETRY_LOST_MS: u64 = 800;
 /// 服务端不可达时的重试间隔(毫秒)
-const POLL_OFFLINE_MS: u64 = 1500;
+const RETRY_OFFLINE_MS: u64 = 1500;
 
-/// 客户端运行模式:离线重试 / 待机轮询 / 正在收流
+/// 客户端运行模式:连接/重连中 / 正在收流 / 已结束(被接管或服务端停止)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
-    Offline = 0,
-    Standby = 1,
+    Connecting = 0,
     Streaming = 2,
+    Ended = 3,
 }
 
 impl Mode {
     fn from_u8(v: u8) -> Mode {
         match v {
             2 => Mode::Streaming,
-            1 => Mode::Standby,
-            _ => Mode::Offline,
+            3 => Mode::Ended,
+            _ => Mode::Connecting,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Mode::Offline => "offline",
-            Mode::Standby => "standby",
+            Mode::Connecting => "connecting",
             Mode::Streaming => "streaming",
+            Mode::Ended => "ended",
         }
     }
 }
 
+/// 一轮串流会话的结束方式
+enum StreamEnd {
+    /// 服务端发来 0 长度结束帧(被抢占 / 服务端停止),不应自动重连
+    Graceful(u32),
+    /// 网络中断/服务端异常退出,应自动重连
+    Lost,
+    /// 用户主动停止
+    Stopped,
+}
+
 struct Shared {
     mode: AtomicU8,
-    /// 服务端采样率(握手/健康检查里读到的)
+    /// 服务端采样率(串流握手里读到的)
     src_rate: AtomicU32,
     /// 本机输出设备采样率;0 = 播放流尚未就绪
     out_rate: AtomicU32,
@@ -60,13 +70,6 @@ struct Shared {
     error: Mutex<Option<String>>,
 }
 
-/// /health 响应里客户端关心的字段
-struct Health {
-    mic_active: bool,
-    streaming: bool,
-    sample_rate: u32,
-}
-
 pub struct ClientHandle {
     pub addr: String,
     pub output_device: String,
@@ -75,7 +78,7 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
-    /// 监听是否仍在运行(停止后为 false;离线重试中仍为 true)
+    /// 使用是否仍在进行(用户停止或被接管后为 false;断线重连中仍为 true)
     pub fn is_connected(&self) -> bool {
         !self.stop.load(Ordering::SeqCst)
     }
@@ -116,7 +119,8 @@ impl Drop for ClientHandle {
     }
 }
 
-/// 开始监听服务端:先做一次 /health 校验,之后由后台线程事件驱动收流
+/// 开始使用远端麦克风:先 /health 校验服务端,随后后台线程认领 /stream。
+/// 请求即是事件——服务端收到后才会打开麦克风;停止使用即关闭。
 pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHandle, String> {
     // 允许省略端口
     let full_addr = if addr.contains(':') {
@@ -132,12 +136,12 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
         .ok_or_else(|| format!("地址无法解析: {full_addr}"))?;
 
     // 立即校验对方是 MicSync 服务端,失败直接报错给用户
-    let health = fetch_health(&sock_addr, &full_addr, Duration::from_secs(3))?;
+    fetch_health(&sock_addr, &full_addr, Duration::from_secs(3))?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
-        mode: AtomicU8::new(Mode::Standby as u8),
-        src_rate: AtomicU32::new(health.sample_rate),
+        mode: AtomicU8::new(Mode::Connecting as u8),
+        src_rate: AtomicU32::new(0),
         out_rate: AtomicU32::new(0),
         level: AtomicU32::new(0),
         buffer: Mutex::new(VecDeque::new()),
@@ -164,15 +168,15 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
             e
         })?;
 
-    // 监听线程:轮询 /health,mic 激活且串流空闲时认领 /stream
+    // 认领线程:请求 /stream 触发服务端开麦;断线自动重连,被接管则停止
     {
         let stop = stop.clone();
         let shared = shared.clone();
         let host = full_addr.clone();
         thread::Builder::new()
-            .name("mic-watch".into())
-            .spawn(move || watcher_thread(sock_addr, host, stop, shared))
-            .map_err(|e| format!("创建监听线程失败: {e}"))?;
+            .name("mic-claim".into())
+            .spawn(move || claim_thread(sock_addr, host, stop, shared))
+            .map_err(|e| format!("创建认领线程失败: {e}"))?;
     }
 
     Ok(ClientHandle {
@@ -183,47 +187,41 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
     })
 }
 
-fn watcher_thread(sock_addr: SocketAddr, host: String, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
+fn claim_thread(sock_addr: SocketAddr, host: String, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
     while !stop.load(Ordering::SeqCst) {
-        match fetch_health(&sock_addr, &host, Duration::from_millis(1500)) {
-            Err(e) => {
-                shared.mode.store(Mode::Offline as u8, Ordering::Relaxed);
-                *shared.error.lock().unwrap() = Some(format!("服务端不可达,自动重试中: {e}"));
-                sleep_check(&stop, POLL_OFFLINE_MS);
-            }
-            Ok(h) => {
-                if Mode::from_u8(shared.mode.load(Ordering::Relaxed)) == Mode::Offline {
-                    // 服务端恢复:清掉离线错误
-                    *shared.error.lock().unwrap() = None;
-                }
-                shared.mode.store(Mode::Standby as u8, Ordering::Relaxed);
-                if h.sample_rate != 0 {
-                    shared.src_rate.store(h.sample_rate, Ordering::Relaxed);
-                }
-                if h.mic_active && !h.streaming {
-                    match open_stream(&sock_addr, &host) {
-                        Ok(Some((stream, src_rate))) => {
-                            shared.src_rate.store(src_rate, Ordering::Relaxed);
-                            *shared.error.lock().unwrap() = None;
-                            shared.mode.store(Mode::Streaming as u8, Ordering::Relaxed);
-                            run_stream(stream, &stop, &shared);
-                            // 本轮结束(服务端静音收流/断开)→ 回待机继续轮询
-                            shared.mode.store(Mode::Standby as u8, Ordering::Relaxed);
-                        }
-                        // 槽位被别的设备抢先认领 → 回待机
-                        Ok(None) => sleep_check(&stop, POLL_STANDBY_MS),
-                        Err(e) => {
-                            *shared.error.lock().unwrap() = Some(e);
-                            sleep_check(&stop, POLL_STANDBY_MS);
-                        }
+        match open_stream(&sock_addr, &host) {
+            Ok((stream, src_rate)) => {
+                shared.src_rate.store(src_rate, Ordering::Relaxed);
+                *shared.error.lock().unwrap() = None;
+                shared.mode.store(Mode::Streaming as u8, Ordering::Relaxed);
+                match run_stream(stream, &stop, &shared) {
+                    StreamEnd::Graceful(reason) => {
+                        // 服务端明确结束:不自动重连,等用户重新发起
+                        let msg = if reason == END_PREEMPTED {
+                            "麦克风已被其他设备接管,本机已停止使用"
+                        } else {
+                            "服务端已停止共享"
+                        };
+                        *shared.error.lock().unwrap() = Some(msg.into());
+                        shared.mode.store(Mode::Ended as u8, Ordering::Relaxed);
+                        stop.store(true, Ordering::SeqCst);
+                        return;
                     }
-                } else {
-                    sleep_check(&stop, POLL_STANDBY_MS);
+                    StreamEnd::Stopped => return,
+                    StreamEnd::Lost => {
+                        shared.mode.store(Mode::Connecting as u8, Ordering::Relaxed);
+                        *shared.error.lock().unwrap() = Some("连接中断,自动重连中".into());
+                        sleep_check(&stop, RETRY_LOST_MS);
+                    }
                 }
+            }
+            Err(e) => {
+                shared.mode.store(Mode::Connecting as u8, Ordering::Relaxed);
+                *shared.error.lock().unwrap() = Some(format!("服务端不可达,自动重试中: {e}"));
+                sleep_check(&stop, RETRY_OFFLINE_MS);
             }
         }
     }
-    shared.mode.store(Mode::Offline as u8, Ordering::Relaxed);
 }
 
 /// 分段睡眠,期间发现停止立即返回
@@ -236,10 +234,10 @@ fn sleep_check(stop: &AtomicBool, ms: u64) {
     }
 }
 
-/// GET /health:确认对方是 MicSync 服务端并读取状态
-fn fetch_health(sock_addr: &SocketAddr, host: &str, timeout: Duration) -> Result<Health, String> {
-    let mut stream = TcpStream::connect_timeout(sock_addr, timeout)
-        .map_err(|e| format!("连接失败: {e}"))?;
+/// GET /health:确认对方是 MicSync 服务端(仅在发起使用时校验一次)
+fn fetch_health(sock_addr: &SocketAddr, host: &str, timeout: Duration) -> Result<(), String> {
+    let mut stream =
+        TcpStream::connect_timeout(sock_addr, timeout).map_err(|e| format!("连接失败: {e}"))?;
     let _ = stream.set_nodelay(true);
     stream
         .set_read_timeout(Some(timeout))
@@ -247,7 +245,9 @@ fn fetch_health(sock_addr: &SocketAddr, host: &str, timeout: Duration) -> Result
     let _ = stream.set_write_timeout(Some(timeout));
 
     stream
-        .write_all(format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
         .map_err(|e| format!("发送请求失败: {e}"))?;
 
     let mut resp = String::new();
@@ -263,11 +263,7 @@ fn fetch_health(sock_addr: &SocketAddr, host: &str, timeout: Duration) -> Result
     if v.get("app").and_then(|x| x.as_str()) != Some("micsync") {
         return Err("对方不是 MicSync 服务端".into());
     }
-    Ok(Health {
-        mic_active: v.get("mic_active").and_then(|x| x.as_bool()).unwrap_or(false),
-        streaming: v.get("streaming").and_then(|x| x.as_bool()).unwrap_or(false),
-        sample_rate: v.get("sample_rate").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-    })
+    Ok(())
 }
 
 /// 拆 HTTP 响应:返回 (状态码, body)
@@ -287,17 +283,20 @@ fn split_http_response(resp: &str) -> Result<(u16, &str), String> {
     Ok((code, body))
 }
 
-/// GET /stream:认领串流。Ok(None) = 槽位被占/mic 刚转静音,稍后重试
-fn open_stream(sock_addr: &SocketAddr, host: &str) -> Result<Option<(TcpStream, u32)>, String> {
+/// GET /stream:请求使用麦克风(服务端据此按需开麦,新请求接管旧串流)
+fn open_stream(sock_addr: &SocketAddr, host: &str) -> Result<(TcpStream, u32), String> {
     let mut stream = TcpStream::connect_timeout(sock_addr, Duration::from_secs(2))
         .map_err(|e| format!("连接失败: {e}"))?;
     let _ = stream.set_nodelay(true);
+    // 服务端开麦最长约 5 秒,读超时给足余量
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(8)))
         .map_err(|e| format!("设置超时失败: {e}"))?;
 
     stream
-        .write_all(format!("GET /stream HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET /stream HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
         .map_err(|e| format!("发送请求失败: {e}"))?;
 
     // 逐字节读响应头(空行之后即二进制音频流,不能多读)
@@ -325,11 +324,15 @@ fn open_stream(sock_addr: &SocketAddr, host: &str) -> Result<Option<(TcpStream, 
         .nth(1)
         .and_then(|c| c.parse().ok())
         .ok_or_else(|| "串流响应状态行异常".to_string())?;
-    if code == 409 {
-        return Ok(None);
-    }
     if code != 200 {
-        return Err(format!("串流请求被拒: HTTP {code}"));
+        // 带上服务端给的原因(如 503 开麦失败)
+        let mut body = String::new();
+        let _ = stream.read_to_string(&mut body);
+        let msg = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+            .unwrap_or_else(|| format!("HTTP {code}"));
+        return Err(format!("服务端拒绝串流: {msg}"));
     }
 
     // 读二进制流头并校验
@@ -344,11 +347,11 @@ fn open_stream(sock_addr: &SocketAddr, host: &str) -> Result<Option<(TcpStream, 
     if !(8000..=192_000).contains(&src_rate) {
         return Err(format!("服务端采样率异常: {src_rate}"));
     }
-    Ok(Some((stream, src_rate)))
+    Ok((stream, src_rate))
 }
 
-/// 一轮串流会话:读帧 → 重采样 → 进抖动缓冲;流结束(服务端静音收流)即返回
-fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) {
+/// 一轮串流会话:读帧 → 重采样 → 进抖动缓冲,直到会话结束
+fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) -> StreamEnd {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
 
     // 等待播放线程就绪,拿到输出采样率后才能建重采样器
@@ -358,7 +361,7 @@ fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) {
             break r;
         }
         if stop.load(Ordering::SeqCst) {
-            return;
+            return StreamEnd::Stopped;
         }
         thread::sleep(Duration::from_millis(10));
     };
@@ -370,8 +373,11 @@ fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) {
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut resampled: Vec<f32> = Vec::new();
 
-    while !stop.load(Ordering::SeqCst) {
-        // 读帧头(样本数);EOF/断开 = 本轮串流结束,不算错误
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return StreamEnd::Stopped;
+        }
+        // 读帧头(样本数)
         match stream.read_exact(&mut len_buf) {
             Ok(()) => {}
             Err(e)
@@ -380,16 +386,25 @@ fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) {
             {
                 continue
             }
-            Err(_) => return,
+            Err(_) => return StreamEnd::Lost,
         }
         let n_samples = u32::from_le_bytes(len_buf) as usize;
-        if n_samples == 0 || n_samples > 1 << 20 {
+        if n_samples == 0 {
+            // 优雅结束帧:后随 u32 原因码(被接管 / 服务端停止)
+            let mut reason = [0u8; 4];
+            let reason = match stream.read_exact(&mut reason) {
+                Ok(()) => u32::from_le_bytes(reason),
+                Err(_) => crate::server::END_SERVER_CLOSING,
+            };
+            return StreamEnd::Graceful(reason);
+        }
+        if n_samples > 1 << 20 {
             *shared.error.lock().unwrap() = Some("收到异常数据帧,本轮串流已断开".into());
-            return;
+            return StreamEnd::Lost;
         }
         byte_buf.resize(n_samples * 2, 0);
         if stream.read_exact(&mut byte_buf).is_err() {
-            return;
+            return StreamEnd::Lost;
         }
 
         let samples: Vec<i16> = byte_buf
@@ -453,7 +468,7 @@ fn playback_thread(
                     match buf.pop_front() {
                         Some(s) => s,
                         None => {
-                            // 欠载:回到蓄水状态(串流间歇期为常态)
+                            // 欠载:回到蓄水状态
                             shared.started.store(false, Ordering::Relaxed);
                             0.0
                         }
@@ -559,13 +574,15 @@ fn playback_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::END_SERVER_CLOSING;
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
 
     /// 构造测试用共享状态;out_rate 预置为已就绪,绕过真实声卡
     /// (无头测试进程里 CoreAudio 设备枚举可能耗时近 1 分钟,不能依赖)
     fn test_shared(out_rate: u32) -> Arc<Shared> {
         Arc::new(Shared {
-            mode: AtomicU8::new(Mode::Standby as u8),
+            mode: AtomicU8::new(Mode::Connecting as u8),
             src_rate: AtomicU32::new(0),
             out_rate: AtomicU32::new(out_rate),
             level: AtomicU32::new(0),
@@ -575,12 +592,12 @@ mod tests {
         })
     }
 
-    fn spawn_watcher(addr: SocketAddr, shared: &Arc<Shared>) -> Arc<AtomicBool> {
+    fn spawn_claimer(addr: SocketAddr, shared: &Arc<Shared>) -> Arc<AtomicBool> {
         let stop = Arc::new(AtomicBool::new(false));
         {
             let stop = stop.clone();
             let shared = shared.clone();
-            thread::spawn(move || watcher_thread(addr, addr.to_string(), stop, shared));
+            thread::spawn(move || claim_thread(addr, addr.to_string(), stop, shared));
         }
         stop
     }
@@ -589,92 +606,132 @@ mod tests {
         Mode::from_u8(shared.mode.load(Ordering::Relaxed))
     }
 
-    /// 极简假服务端:循环应答 /health;/stream 发 1.5 秒 440Hz 正弦波
-    /// mic_active/streaming 由调用方指定;serve_stream=false 时 /stream 一律 409
-    fn spawn_fake_server(mic_active: bool, streaming: bool, serve_stream: bool) -> SocketAddr {
+    fn read_req(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&head).to_string()
+    }
+
+    fn write_health(stream: &mut TcpStream) {
+        let body = r#"{"status":"ok","app":"micsync","streaming":false,"client":"","sample_rate":44100}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    }
+
+    fn write_stream_header(stream: &mut TcpStream) -> bool {
+        let mut resp = Vec::new();
+        resp.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+        );
+        resp.extend_from_slice(MAGIC);
+        resp.extend_from_slice(&44100u32.to_le_bytes());
+        resp.extend_from_slice(&1u16.to_le_bytes());
+        resp.extend_from_slice(&0u16.to_le_bytes());
+        stream.write_all(&resp).is_ok()
+    }
+
+    /// 实时节奏发 10ms 一帧的 440Hz 正弦波(幅度低,喇叭里只有轻微提示音)
+    fn write_sine_frames(stream: &mut TcpStream, n: usize) -> bool {
+        let frame_len = 441usize;
+        let mut phase = 0.0f32;
+        for _ in 0..n {
+            let mut buf = Vec::with_capacity(4 + frame_len * 2);
+            buf.extend_from_slice(&(frame_len as u32).to_le_bytes());
+            for _ in 0..frame_len {
+                let s = (phase * std::f32::consts::TAU).sin() * 0.15;
+                phase = (phase + 440.0 / 44100.0).fract();
+                buf.extend_from_slice(&((s * i16::MAX as f32) as i16).to_le_bytes());
+            }
+            if stream.write_all(&buf).is_err() {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    fn write_end(stream: &mut TcpStream, reason: u32) {
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&reason.to_le_bytes());
+        let _ = stream.write_all(&buf);
+    }
+
+    /// 假服务端:/health 应答;/stream 按 plan 行为。返回 (地址, /stream 计数)
+    #[derive(Clone, Copy)]
+    enum StreamPlan {
+        /// 持续发帧(约 n 帧后正常继续下一连接)
+        Frames(usize),
+        /// 发几帧后发结束帧(原因码)
+        EndAfter(usize, u32),
+        /// 发几帧后直接断开(模拟网络中断/服务端崩溃)
+        DropAfter(usize),
+    }
+
+    fn spawn_fake_server(plan: StreamPlan) -> (SocketAddr, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
+        let claims = Arc::new(AtomicUsize::new(0));
+        let claims_ret = claims.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut stream) = conn else { continue };
                 let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                // 读请求头
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                loop {
-                    match stream.read(&mut byte) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            head.push(byte[0]);
-                            if head.ends_with(b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let head = String::from_utf8_lossy(&head).to_string();
+                let head = read_req(&mut stream);
                 if head.starts_with("GET /health") {
-                    let body = format!(
-                        r#"{{"status":"ok","app":"micsync","sample_rate":44100,"device":"fake","mic_active":{mic_active},"streaming":{streaming}}}"#
-                    );
-                    let _ = stream.write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    );
+                    write_health(&mut stream);
                 } else if head.starts_with("GET /stream") {
-                    if !serve_stream {
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"error\":\"busy\"}",
-                        );
+                    claims.fetch_add(1, Ordering::SeqCst);
+                    if !write_stream_header(&mut stream) {
                         continue;
                     }
-                    let mut resp = Vec::new();
-                    resp.extend_from_slice(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-                    );
-                    resp.extend_from_slice(MAGIC);
-                    resp.extend_from_slice(&44100u32.to_le_bytes());
-                    resp.extend_from_slice(&1u16.to_le_bytes());
-                    resp.extend_from_slice(&0u16.to_le_bytes());
-                    if stream.write_all(&resp).is_err() {
-                        continue;
-                    }
-                    // 实时节奏发 10ms 帧,共 1.5 秒(幅度调低,测试时喇叭里只有轻微提示音)
-                    let frame_len = 441usize;
-                    let mut phase = 0.0f32;
-                    for _ in 0..150 {
-                        let mut buf = Vec::with_capacity(4 + frame_len * 2);
-                        buf.extend_from_slice(&(frame_len as u32).to_le_bytes());
-                        for _ in 0..frame_len {
-                            let s = (phase * std::f32::consts::TAU).sin() * 0.15;
-                            phase = (phase + 440.0 / 44100.0).fract();
-                            buf.extend_from_slice(&((s * i16::MAX as f32) as i16).to_le_bytes());
+                    match plan {
+                        StreamPlan::Frames(n) => {
+                            let _ = write_sine_frames(&mut stream, n);
                         }
-                        if stream.write_all(&buf).is_err() {
-                            break;
+                        StreamPlan::EndAfter(n, reason) => {
+                            let _ = write_sine_frames(&mut stream, n);
+                            write_end(&mut stream, reason);
                         }
-                        thread::sleep(Duration::from_millis(10));
+                        StreamPlan::DropAfter(n) => {
+                            let _ = write_sine_frames(&mut stream, n);
+                            // 直接 drop 连接
+                        }
                     }
                 }
             }
         });
-        addr
+        (addr, claims_ret)
     }
 
-    /// health 显示 mic 激活 → 监听线程自动认领串流,音频进入抖动缓冲
+    /// 认领即收流:发起使用后进入 Streaming,音频进入抖动缓冲
     #[test]
-    fn watcher_streams_when_mic_active() {
-        let addr = spawn_fake_server(true, false, true);
+    fn claimer_streams_on_demand() {
+        let (addr, claims) = spawn_fake_server(StreamPlan::Frames(150));
         let shared = test_shared(44100);
-        let stop = spawn_watcher(addr, &shared);
+        let stop = spawn_claimer(addr, &shared);
 
         thread::sleep(Duration::from_millis(700));
         assert_eq!(mode_of(&shared), Mode::Streaming, "should be streaming");
         assert_eq!(shared.src_rate.load(Ordering::Relaxed), 44100);
+        assert!(claims.load(Ordering::SeqCst) >= 1);
         assert!(
             !shared.buffer.lock().unwrap().is_empty(),
             "jitter buffer should be filling"
@@ -684,76 +741,50 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
     }
 
-    /// 串流被其他设备占用:保持待机,不报错、不抢流
+    /// 被其他设备接管:收到结束帧后停止使用,不再自动重连
     #[test]
-    fn watcher_stays_standby_when_stream_busy() {
-        let addr = spawn_fake_server(true, true, false);
-        let shared = test_shared(48000);
-        let stop = spawn_watcher(addr, &shared);
+    fn claimer_stops_when_preempted() {
+        let (addr, claims) = spawn_fake_server(StreamPlan::EndAfter(10, END_PREEMPTED));
+        let shared = test_shared(44100);
+        let stop = spawn_claimer(addr, &shared);
+
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(mode_of(&shared), Mode::Ended, "should end after preemption");
+        assert!(stop.load(Ordering::SeqCst), "claimer should stop itself");
+        let err = shared.error.lock().unwrap().clone().unwrap_or_default();
+        assert!(err.contains("接管"), "error should mention takeover: {err}");
+        // 结束后不再发起新的认领
+        let claimed = claims.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(claims.load(Ordering::SeqCst), claimed, "must not reclaim");
+    }
+
+    /// 服务端停止:收到结束帧后停止使用
+    #[test]
+    fn claimer_stops_when_server_closes() {
+        let (addr, _claims) = spawn_fake_server(StreamPlan::EndAfter(5, END_SERVER_CLOSING));
+        let shared = test_shared(44100);
+        let stop = spawn_claimer(addr, &shared);
 
         thread::sleep(Duration::from_millis(600));
-        assert_eq!(mode_of(&shared), Mode::Standby, "should stay standby");
-        assert!(shared.buffer.lock().unwrap().is_empty(), "no audio expected");
-        let err = shared.error.lock().unwrap().clone();
-        assert!(err.is_none(), "unexpected error: {err:?}");
-        stop.store(true, Ordering::SeqCst);
+        assert_eq!(mode_of(&shared), Mode::Ended);
+        assert!(stop.load(Ordering::SeqCst));
     }
 
-    /// mic 未激活:待机等待,不请求串流
+    /// 网络中断(无结束帧):自动重连,再次认领
     #[test]
-    fn watcher_waits_while_mic_idle() {
-        let addr = spawn_fake_server(false, false, false);
-        let shared = test_shared(48000);
-        let stop = spawn_watcher(addr, &shared);
+    fn claimer_reclaims_after_drop() {
+        let (addr, claims) = spawn_fake_server(StreamPlan::DropAfter(5));
+        let shared = test_shared(44100);
+        let stop = spawn_claimer(addr, &shared);
 
-        thread::sleep(Duration::from_millis(600));
-        assert_eq!(mode_of(&shared), Mode::Standby);
-        assert!(shared.buffer.lock().unwrap().is_empty(), "no audio expected");
-        stop.store(true, Ordering::SeqCst);
-    }
-
-    /// 服务端不可达:进入离线模式并带错误信息,持续重试
-    #[test]
-    fn watcher_reports_offline() {
-        // 拿一个刚释放的端口,必然连接被拒
-        let addr = {
-            let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().unwrap()
-        };
-        let shared = test_shared(48000);
-        let stop = spawn_watcher(addr, &shared);
-
-        thread::sleep(Duration::from_millis(500));
-        assert_eq!(mode_of(&shared), Mode::Offline);
-        assert!(shared.error.lock().unwrap().is_some(), "offline error expected");
-        stop.store(true, Ordering::SeqCst);
-    }
-
-    /// 端到端(打开真实声卡出声)。无头环境下 CoreAudio 设备枚举极慢会超时,
-    /// 手动验证: cargo test -- --ignored
-    #[test]
-    #[ignore = "需要真实输出声卡,手动运行"]
-    fn client_streams_end_to_end() {
-        let addr = spawn_fake_server(true, false, true);
-        let handle =
-            connect(addr.to_string(), None).expect("client should connect to fake server");
-        assert!(handle.is_connected());
-        assert_eq!(handle.src_rate(), 44100);
-
-        // 等待认领串流、越过起播水位并真正出声
-        thread::sleep(Duration::from_millis(900));
-        assert_eq!(handle.mode(), Mode::Streaming, "should be streaming");
+        thread::sleep(Duration::from_millis(2500));
         assert!(
-            handle.level() > 0.01,
-            "playback level should be non-zero, got {}",
-            handle.level()
+            claims.load(Ordering::SeqCst) >= 2,
+            "should auto-reclaim after connection drop, claims={}",
+            claims.load(Ordering::SeqCst)
         );
-        let err = handle.take_error();
-        assert!(err.is_none(), "unexpected error: {err:?}");
-
-        handle.stop();
-        thread::sleep(Duration::from_millis(300));
-        assert!(!handle.is_connected(), "stop() should disconnect");
+        stop.store(true, Ordering::SeqCst);
     }
 
     #[test]
@@ -774,5 +805,32 @@ mod tests {
         // TEST-NET-1 地址,必然连不上
         let result = connect("192.0.2.1:47800".into(), None);
         assert!(result.is_err());
+    }
+
+    /// 端到端(打开真实声卡出声)。无头环境下 CoreAudio 设备枚举极慢会超时,
+    /// 手动验证: cargo test -- --ignored
+    #[test]
+    #[ignore = "需要真实输出声卡,手动运行"]
+    fn client_streams_end_to_end() {
+        let (addr, _claims) = spawn_fake_server(StreamPlan::Frames(150));
+        let handle =
+            connect(addr.to_string(), None).expect("client should connect to fake server");
+        assert!(handle.is_connected());
+
+        // 等待认领串流、越过起播水位并真正出声
+        thread::sleep(Duration::from_millis(900));
+        assert_eq!(handle.mode(), Mode::Streaming, "should be streaming");
+        assert_eq!(handle.src_rate(), 44100);
+        assert!(
+            handle.level() > 0.01,
+            "playback level should be non-zero, got {}",
+            handle.level()
+        );
+        let err = handle.take_error();
+        assert!(err.is_none(), "unexpected error: {err:?}");
+
+        handle.stop();
+        thread::sleep(Duration::from_millis(300));
+        assert!(!handle.is_connected(), "stop() should disconnect");
     }
 }
