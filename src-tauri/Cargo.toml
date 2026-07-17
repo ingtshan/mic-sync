@@ -1,6 +1,6 @@
 [package]
 name = "mic-sync"
-version = "0.5.0"
+version = "0.6.0"
 description = "Share one physical microphone across multiple Macs over LAN"
 edition = "2021"
 
@@ -25,8 +25,11 @@ gethostname = "1"
 
 # 桌面端:单实例守护——重复启动(如关窗后台驻留时再次打开另一份 .app)
 # 只唤回已有窗口,避免两个实例的自动跟随互相抢占麦克风
+# notification:待确认请求的系统通知——服务端常驻托盘时同意弹窗渲染在
+# 隐藏窗口里,不另行提醒用户根本无从知晓
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
 
 # iOS: cpal 只管 AudioUnit,AVAudioSession 类别/激活/录音权限要 App 自己配
 [target.'cfg(target_os = "ios")'.dependencies]

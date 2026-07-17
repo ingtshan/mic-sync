@@ -352,6 +352,11 @@ function applyPending(p) {
   if (!consentShown) {
     $("consent-name").textContent = p.name;
     $("consent-addr").textContent = p.addr;
+    // 预授权(自动跟随开启时)与立即开麦的请求,同意的含义不同,文案要说清
+    $("consent-verb").textContent =
+      p.kind === "authorize"
+        ? "开启了自动跟随,想在需要时使用这台设备的麦克风"
+        : "想使用这台设备的麦克风";
     overlay.classList.remove("hidden");
     consentShown = true;
   }
@@ -526,6 +531,8 @@ function applyFollowStatus(s) {
   $("client-info").classList.remove("hidden");
   const c = s.client || {};
   const views = {
+    authorizing: ["yellow", `正在请求 ${s.addr} 授权 · 等待对方确认…`],
+    auth_denied: ["red", "对方未同意授权,自动跟随已停止"],
     armed: ["gray", `自动待命 · 本机应用一用麦克风就自动接入(${s.addr})`],
     active:
       c.mode === "streaming"

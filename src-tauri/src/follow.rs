@@ -33,6 +33,10 @@ pub enum Phase {
     Unsupported = 4,
     /// 本轮使用结束(正常释放或服务端停止)后的排空:等设备空闲再重新武装
     Draining = 5,
+    /// 启动预授权中:已向服务端请求授权,等对方确认(不开麦)
+    Authorizing = 6,
+    /// 预授权被对方拒绝:终态,等用户自己停掉/重开跟随
+    AuthDenied = 7,
 }
 
 impl Phase {
@@ -43,6 +47,8 @@ impl Phase {
             3 => Phase::DeviceMissing,
             4 => Phase::Unsupported,
             5 => Phase::Draining,
+            6 => Phase::Authorizing,
+            7 => Phase::AuthDenied,
             _ => Phase::Armed,
         }
     }
@@ -55,6 +61,8 @@ impl Phase {
             Phase::DeviceMissing => "device_missing",
             Phase::Unsupported => "unsupported",
             Phase::Draining => "draining",
+            Phase::Authorizing => "authorizing",
+            Phase::AuthDenied => "auth_denied",
         }
     }
 }
@@ -133,7 +141,10 @@ impl FollowGate {
                 }
                 FollowAction::None
             }
-            Phase::DeviceMissing | Phase::Unsupported => FollowAction::None,
+            // 预授权阶段由外层控制,状态机本体不会进入这两个状态
+            Phase::DeviceMissing | Phase::Unsupported | Phase::Authorizing | Phase::AuthDenied => {
+                FollowAction::None
+            }
         }
     }
 
@@ -247,7 +258,45 @@ const UNSUPPORTED_MSG: &str = "自动跟随需要 macOS 14 及以上(Process Obj
 #[cfg(not(target_os = "macos"))]
 const UNSUPPORTED_MSG: &str = "当前系统不支持自动跟随,请改用手动模式";
 
+/// 启动预授权:通过 /authorize 先取得对方同意(不开麦),再进入待命——
+/// 确认弹窗不该拖到用户开口说话那一刻才在对面弹出来。
+/// 返回 false = 不进入监视(被拒绝终态,或用户停止);网络失败自动重试。
+/// 旧版服务端没有 /authorize:退回「用到时再确认」的老流程,照常返回 true
+fn preauth_gate(addr: &str, stop: &AtomicBool, shared: &Shared) -> bool {
+    shared
+        .phase
+        .store(Phase::Authorizing as u8, Ordering::Relaxed);
+    while !stop.load(Ordering::SeqCst) {
+        match client::preauthorize(addr, stop) {
+            Ok(client::Preauth::Granted) | Ok(client::Preauth::Unsupported) => {
+                *shared.error.lock().unwrap() = None;
+                return true;
+            }
+            // 拒绝是人的决定:终态,别再自动重试骚扰对方
+            Ok(client::Preauth::Denied(msg)) => {
+                *shared.error.lock().unwrap() = Some(msg);
+                shared
+                    .phase
+                    .store(Phase::AuthDenied as u8, Ordering::Relaxed);
+                return false;
+            }
+            Err(e) => {
+                // 用户停止跟随导致的中断不是错误,别留下误导性的重试提示
+                if stop.load(Ordering::SeqCst) {
+                    return false;
+                }
+                *shared.error.lock().unwrap() = Some(format!("请求授权失败,自动重试中: {e}"));
+                sleep_check(stop, CLAIM_RETRY_MS);
+            }
+        }
+    }
+    false
+}
+
 fn follow_thread(addr: String, device_name: String, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
+    if !preauth_gate(&addr, &stop, &shared) {
+        return;
+    }
     let mut gate = FollowGate::new(RELEASE_HANGOVER_MS);
     let start = Instant::now();
     let mut target: Option<micuse::MonitorTarget> = None;
@@ -257,7 +306,9 @@ fn follow_thread(addr: String, device_name: String, stop: Arc<AtomicBool>, share
         if target.is_none() {
             target = micuse::find_monitor_target(&device_name);
             if target.is_none() {
-                shared.phase.store(Phase::DeviceMissing as u8, Ordering::Relaxed);
+                shared
+                    .phase
+                    .store(Phase::DeviceMissing as u8, Ordering::Relaxed);
                 sleep_check(&stop, 1000);
                 continue;
             }
@@ -269,7 +320,9 @@ fn follow_thread(addr: String, device_name: String, stop: Arc<AtomicBool>, share
             MicUse::InUse => true,
             MicUse::Idle => false,
             MicUse::Unsupported => {
-                shared.phase.store(Phase::Unsupported as u8, Ordering::Relaxed);
+                shared
+                    .phase
+                    .store(Phase::Unsupported as u8, Ordering::Relaxed);
                 *shared.error.lock().unwrap() = Some(UNSUPPORTED_MSG.into());
                 return;
             }
@@ -298,19 +351,17 @@ fn follow_thread(addr: String, device_name: String, stop: Arc<AtomicBool>, share
 
         let now_ms = start.elapsed().as_millis() as u64;
         match gate.step(device_busy, other_capturing, now_ms) {
-            FollowAction::Claim => {
-                match client::connect(addr.clone(), Some(device_name.clone())) {
-                    Ok(h) => {
-                        *shared.client.lock().unwrap() = Some(h);
-                        *shared.error.lock().unwrap() = None;
-                    }
-                    Err(e) => {
-                        *shared.error.lock().unwrap() = Some(format!("认领远端麦克风失败: {e}"));
-                        gate.on_claim_failed();
-                        sleep_check(&stop, CLAIM_RETRY_MS);
-                    }
+            FollowAction::Claim => match client::connect(addr.clone(), Some(device_name.clone())) {
+                Ok(h) => {
+                    *shared.client.lock().unwrap() = Some(h);
+                    *shared.error.lock().unwrap() = None;
                 }
-            }
+                Err(e) => {
+                    *shared.error.lock().unwrap() = Some(format!("认领远端麦克风失败: {e}"));
+                    gate.on_claim_failed();
+                    sleep_check(&stop, CLAIM_RETRY_MS);
+                }
+            },
             FollowAction::Release => {
                 if let Some(h) = shared.client.lock().unwrap().take() {
                     h.stop();
@@ -341,6 +392,110 @@ fn sleep_check(stop: &AtomicBool, ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+
+    fn test_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            phase: AtomicU8::new(Phase::Armed as u8),
+            local_in_use: AtomicBool::new(false),
+            client: Mutex::new(None),
+            error: Mutex::new(None),
+        })
+    }
+
+    fn read_req(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&head).to_string()
+    }
+
+    fn write_resp(stream: &mut TcpStream, status: &str, extra: &str, body: &str) {
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    }
+
+    /// 假服务端:/health 正常应答;/authorize 按给定状态码回应
+    fn spawn_auth_server(authorize_status: u16) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let device_id = format!("follow-test-{}", addr.port());
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let head = read_req(&mut s);
+                if head.starts_with("GET /health") {
+                    let body = format!(
+                        r#"{{"status":"ok","app":"micsync","streaming":false,"client":"","sample_rate":0,"alias":"测试端","device_type":"desktop","device_id":"{device_id}"}}"#
+                    );
+                    write_resp(&mut s, "200 OK", "", &body);
+                } else if head.starts_with("GET /authorize") {
+                    match authorize_status {
+                        200 => write_resp(&mut s, "200 OK", "", r#"{"status":"authorized_once"}"#),
+                        403 => write_resp(
+                            &mut s,
+                            "403 Forbidden",
+                            "",
+                            r#"{"error":"denied","message":"对方拒绝了麦克风授权请求"}"#,
+                        ),
+                        _ => write_resp(&mut s, "404 Not Found", "", r#"{"error":"not_found"}"#),
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    /// 对方同意(或本就有授权)→ 进入监视待命
+    #[test]
+    fn preauth_gate_proceeds_when_granted() {
+        let addr = spawn_auth_server(200);
+        let shared = test_shared();
+        let stop = AtomicBool::new(false);
+        assert!(preauth_gate(&addr.to_string(), &stop, &shared));
+        assert!(shared.error.lock().unwrap().is_none());
+    }
+
+    /// 对方拒绝 → 终态:不进入监视,留下拒绝原因
+    #[test]
+    fn preauth_gate_denied_is_terminal() {
+        let addr = spawn_auth_server(403);
+        let shared = test_shared();
+        let stop = AtomicBool::new(false);
+        assert!(!preauth_gate(&addr.to_string(), &stop, &shared));
+        assert_eq!(
+            Phase::from_u8(shared.phase.load(Ordering::Relaxed)),
+            Phase::AuthDenied
+        );
+        let err = shared.error.lock().unwrap().clone().unwrap_or_default();
+        assert!(err.contains("拒绝"), "应把拒绝原因带给用户: {err}");
+    }
+
+    /// 旧版服务端没有 /authorize(404)→ 照常进入监视,退回用时确认
+    #[test]
+    fn preauth_gate_falls_back_on_old_server() {
+        let addr = spawn_auth_server(404);
+        let shared = test_shared();
+        let stop = AtomicBool::new(false);
+        assert!(preauth_gate(&addr.to_string(), &stop, &shared));
+    }
 
     #[test]
     fn gate_claims_on_local_use_and_releases_after_hangover() {

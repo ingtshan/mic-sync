@@ -10,8 +10,8 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, StreamTrait};
 
 use crate::audio;
-use crate::settings;
 use crate::server::{END_PREEMPTED, MAGIC};
+use crate::settings;
 
 /// 收流缓冲上限(毫秒)——超过则丢最老的数据,防止延迟无限增长
 const MAX_BUFFER_MS: usize = 300;
@@ -151,21 +151,25 @@ impl Drop for ClientHandle {
     }
 }
 
-/// 开始使用远端麦克风:先 /health 校验服务端,随后后台线程认领 /stream。
-/// 请求即是事件——服务端收到后才会打开麦克风;停止使用即关闭。
-pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHandle, String> {
-    // 允许省略端口
+/// 解析服务端地址:允许省略端口,支持 IP 和主机名(含 .local mDNS 名称)
+fn resolve_addr(addr: &str) -> Result<(SocketAddr, String), String> {
     let full_addr = if addr.contains(':') {
-        addr.clone()
+        addr.to_string()
     } else {
         format!("{addr}:{}", crate::DEFAULT_PORT)
     };
-    // 支持 IP 和主机名(含 .local mDNS 名称)
     let sock_addr = full_addr
         .to_socket_addrs()
         .map_err(|e| format!("地址解析失败 {full_addr}: {e}"))?
         .next()
         .ok_or_else(|| format!("地址无法解析: {full_addr}"))?;
+    Ok((sock_addr, full_addr))
+}
+
+/// 开始使用远端麦克风:先 /health 校验服务端,随后后台线程认领 /stream。
+/// 请求即是事件——服务端收到后才会打开麦克风;停止使用即关闭。
+pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHandle, String> {
+    let (sock_addr, full_addr) = resolve_addr(&addr)?;
 
     // 立即校验对方是 MicSync 服务端,并取回其公开身份(用于匹配授权令牌)
     let (server_id, server_name) = fetch_health(&sock_addr, &full_addr, Duration::from_secs(3))?;
@@ -343,6 +347,122 @@ fn fetch_health(
     Ok((id, name))
 }
 
+/// 从响应头里取服务端签发的令牌(「始终允许」时才有)
+fn token_from_head(head: &str) -> Option<String> {
+    head.lines()
+        .skip(1)
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            (k.trim().eq_ignore_ascii_case("x-micsync-token")).then(|| v.trim().to_string())
+        })
+        .filter(|t| !t.is_empty())
+}
+
+/// 预授权的结果
+pub enum Preauth {
+    /// 已获授权:本就有效的令牌、对方刚同意(「始终允许」已把新令牌存好;
+    /// 「允许一次」则对方记了一张一次性放行券)
+    Granted,
+    /// 对方拒绝或未在时限内确认:终态,别再自动重试骚扰对方
+    Denied(String),
+    /// 旧版服务端没有 /authorize:退回「用到时再确认」的老流程
+    Unsupported,
+}
+
+/// 心跳间隔:等对方确认预授权期间,隔这么久发一个字节表明「我还在等」。
+/// 必须远小于服务端的放弃判定时限(15 秒)
+const PREAUTH_HEARTBEAT_MS: u64 = 2000;
+
+/// GET /authorize:预先请求对方授权本机使用其麦克风,但不开麦、不占会话。
+/// 自动跟随开启时先走这一步——确认弹窗不该拖到用户开口说话那一刻。
+/// 预授权的确认不设时限(挂到对方处理为止),等待期间发心跳字节表明还在等;
+/// stop 置位即断开连接放弃,对方据此撤掉弹窗。
+/// 网络类失败返回 Err(可重试);拒绝是 Ok(Denied) 终态
+pub fn preauthorize(addr: &str, stop: &AtomicBool) -> Result<Preauth, String> {
+    let (sock_addr, full_addr) = resolve_addr(addr)?;
+    // 取对方公开身份,以便把签发的令牌记在它名下
+    let (server_id, server_name) = fetch_health(&sock_addr, &full_addr, Duration::from_secs(3))?;
+    // 手里已有的令牌也带上:有效则对方直接放行,失效(被撤销)则重新走确认
+    let token = settings::token_for_server(&server_id).unwrap_or_default();
+
+    let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(2))
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    // 短读超时轮询:既能及时发心跳,也能在用户停止跟随时立刻收手
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| format!("设置超时失败: {e}"))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+
+    let name = settings::device_name();
+    let token_header = if token.is_empty() {
+        String::new()
+    } else {
+        format!("X-MicSync-Token: {token}\r\n")
+    };
+    stream
+        .write_all(
+            format!(
+                "GET /authorize HTTP/1.1\r\nHost: {full_addr}\r\nX-MicSync-Name: {name}\r\n{token_header}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .map_err(|e| format!("发送请求失败: {e}"))?;
+
+    // 读响应直到对方关连接(Connection: close);等待期间按节奏发心跳
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 1024];
+    let mut last_beat = std::time::Instant::now();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            // 用户停止跟随:直接断开,对方读到 EOF 就会撤销确认弹窗
+            return Err("已停止等待授权".into());
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if last_beat.elapsed() >= Duration::from_millis(PREAUTH_HEARTBEAT_MS) {
+                    stream
+                        .write_all(b".")
+                        .map_err(|e| format!("等待确认时连接中断: {e}"))?;
+                    last_beat = std::time::Instant::now();
+                }
+            }
+            Err(e) => return Err(format!("读取响应失败: {e}")),
+        }
+    }
+    let resp = String::from_utf8_lossy(&raw).to_string();
+    let (code, body) = split_http_response(&resp)?;
+    let message = |fallback: &str| {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    match code {
+        200 => {
+            // 「始终允许」随响应签发令牌,记下来以后免确认
+            let head = resp.split("\r\n\r\n").next().unwrap_or("");
+            if let Some(t) = token_from_head(head) {
+                settings::remember_server(&server_id, &t, &server_name);
+            }
+            Ok(Preauth::Granted)
+        }
+        // 拒绝/超时未确认是人的决定,不是网络故障——终态
+        403 => Ok(Preauth::Denied(message("对方拒绝了麦克风授权请求"))),
+        // 旧版服务端没有这个接口
+        404 => Ok(Preauth::Unsupported),
+        _ => Err(format!(
+            "服务端拒绝授权请求: {}",
+            message(&format!("HTTP {code}"))
+        )),
+    }
+}
+
 /// 拆 HTTP 响应:返回 (状态码, body)
 fn split_http_response(resp: &str) -> Result<(u16, &str), String> {
     let (head, body) = resp
@@ -435,14 +555,7 @@ fn open_stream(
     }
 
     // 「始终允许」时对方会随响应签发令牌,存下来以后免确认
-    let new_token = head
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            (k.trim().eq_ignore_ascii_case("x-micsync-token")).then(|| v.trim().to_string())
-        })
-        .filter(|t| !t.is_empty());
+    let new_token = token_from_head(&head);
 
     // 读二进制流头并校验
     let mut header = [0u8; 12];
@@ -712,7 +825,11 @@ mod tests {
         spawn_claimer_as(addr, shared, &server_id)
     }
 
-    fn spawn_claimer_as(addr: SocketAddr, shared: &Arc<Shared>, server_id: &str) -> Arc<AtomicBool> {
+    fn spawn_claimer_as(
+        addr: SocketAddr,
+        shared: &Arc<Shared>,
+        server_id: &str,
+    ) -> Arc<AtomicBool> {
         let stop = Arc::new(AtomicBool::new(false));
         let server = ServerIdent {
             id: server_id.to_string(),
@@ -748,7 +865,8 @@ mod tests {
     }
 
     fn write_health(stream: &mut TcpStream) {
-        let body = r#"{"status":"ok","app":"micsync","streaming":false,"client":"","sample_rate":44100}"#;
+        let body =
+            r#"{"status":"ok","app":"micsync","streaming":false,"client":"","sample_rate":44100}"#;
         let _ = stream.write_all(
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -877,7 +995,10 @@ mod tests {
         assert!(stop.load(Ordering::SeqCst), "claimer should stop itself");
         let err = shared.error.lock().unwrap().clone().unwrap_or_default();
         assert!(err.contains("接管"), "error should mention takeover: {err}");
-        assert!(shared.preempted.load(Ordering::Relaxed), "preempted flag should be set");
+        assert!(
+            shared.preempted.load(Ordering::Relaxed),
+            "preempted flag should be set"
+        );
         // 结束后不再发起新的认领
         let claimed = claims.load(Ordering::SeqCst);
         thread::sleep(Duration::from_millis(600));
@@ -942,8 +1063,7 @@ mod tests {
     #[ignore = "需要真实输出声卡,手动运行"]
     fn client_streams_end_to_end() {
         let (addr, _claims) = spawn_fake_server(StreamPlan::Frames(150));
-        let handle =
-            connect(addr.to_string(), None).expect("client should connect to fake server");
+        let handle = connect(addr.to_string(), None).expect("client should connect to fake server");
         assert!(handle.is_connected());
 
         // 等待认领串流、越过起播水位并真正出声
@@ -999,6 +1119,57 @@ mod tests {
         assert!(stop.load(Ordering::SeqCst), "认领线程应已自行收手");
         let err = shared.error.lock().unwrap().clone().unwrap_or_default();
         assert!(err.contains("拒绝"), "应把对方给的原因带给用户: {err}");
+    }
+
+    /// 预授权「始终允许」:随响应签发的令牌要存到对方名下,之后免确认
+    #[test]
+    fn preauthorize_remembers_issued_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device_id = format!("preauth-server-{}", addr.port());
+        {
+            let device_id = device_id.clone();
+            thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut s) = conn else { continue };
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                    let head = read_req(&mut s);
+                    if head.starts_with("GET /health") {
+                        let body = format!(
+                            r#"{{"status":"ok","app":"micsync","streaming":false,"client":"","sample_rate":0,"alias":"测试端","device_id":"{device_id}"}}"#
+                        );
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                    } else if head.starts_with("GET /authorize") {
+                        let body = r#"{"status":"authorized"}"#;
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-MicSync-Token: preauth-token-1\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
+            });
+        }
+
+        match preauthorize(&addr.to_string(), &AtomicBool::new(false)) {
+            Ok(Preauth::Granted) => {}
+            Ok(Preauth::Denied(m)) => panic!("不该被拒绝: {m}"),
+            Ok(Preauth::Unsupported) => panic!("不该判为旧版服务端"),
+            Err(e) => panic!("不该失败: {e}"),
+        }
+        assert_eq!(
+            settings::token_for_server(&device_id).as_deref(),
+            Some("preauth-token-1"),
+            "签发的令牌应存到对方名下"
+        );
     }
 
     /// 服务端不可达属于网络故障,这条路仍应重试(别把重试逻辑一起改坏了)

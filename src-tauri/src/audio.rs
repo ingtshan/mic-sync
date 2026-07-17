@@ -100,7 +100,10 @@ pub fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
 }
 
 pub fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
-    samples.iter().map(|&s| s as f32 / i16::MAX as f32).collect()
+    samples
+        .iter()
+        .map(|&s| s as f32 / i16::MAX as f32)
+        .collect()
 }
 
 /// 流式线性插值重采样器(语音场景足够)

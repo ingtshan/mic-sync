@@ -129,10 +129,16 @@ struct PendingRequest {
     /// 对方自报的设备名——不可信输入,后端已滤掉控制字符并限长
     name: String,
     addr: String,
+    /// "stream" 同意后立即开麦;"authorize" 自动跟随的预授权(用到时才开麦)
+    kind: String,
 }
 
 fn pending_of(h: &server::ServerHandle) -> Option<PendingRequest> {
-    h.pending().map(|(name, addr)| PendingRequest { name, addr })
+    h.pending().map(|(name, addr, kind)| PendingRequest {
+        name,
+        addr,
+        kind: kind.as_str().into(),
+    })
 }
 
 /// 启动组播应答器,让客户端能搜到本机。失败不算错误——组播被网络禁掉、
@@ -385,6 +391,7 @@ fn client_status(state: State<AppState>) -> ClientStatus {
 #[derive(Serialize)]
 struct FollowStatus {
     running: bool,
+    /// "authorizing" 启动预授权中 / "auth_denied" 预授权被拒(终态) /
     /// "armed" 待命 / "active" 使用中 / "suppressed" 被接管抑制 /
     /// "draining" 本轮结束后排空 / "device_missing" 找不到虚拟声卡 /
     /// "unsupported" 系统不支持
@@ -481,16 +488,45 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 托盘菜单。pending = 待确认请求的设备名:有的话在最上面加一个直达入口,
+/// 常驻托盘的用户点一下就能到确认弹窗
+#[cfg(target_os = "macos")]
+fn tray_menu(
+    app: &tauri::AppHandle,
+    pending: Option<&str>,
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let show = MenuItem::with_id(app, "show", "打开 MicSync", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 MicSync", true, None::<&str>)?;
+    match pending {
+        Some(name) => {
+            let attend = MenuItem::with_id(
+                app,
+                "pending",
+                format!("处理「{name}」的请求…"),
+                true,
+                None::<&str>,
+            )?;
+            Menu::with_items(
+                app,
+                &[
+                    &attend,
+                    &PredefinedMenuItem::separator(app)?,
+                    &show,
+                    &PredefinedMenuItem::separator(app)?,
+                    &quit,
+                ],
+            )
+        }
+        None => Menu::with_items(app, &[&show, &PredefinedMenuItem::separator(app)?, &quit]),
+    }
+}
+
 /// macOS:菜单栏托盘,关窗后台运行时的唯一管理入口
 #[cfg(target_os = "macos")]
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    use tauri::{
-        menu::{Menu, MenuItem, PredefinedMenuItem},
-        tray::TrayIconBuilder,
-    };
-    let show = MenuItem::with_id(app, "show", "打开 MicSync", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 MicSync", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &PredefinedMenuItem::separator(app)?, &quit])?;
+    use tauri::tray::TrayIconBuilder;
+    let menu = tray_menu(app.handle(), None)?;
     // 单色线条模板图标(SF Symbol "mic" 渲染),as_template 让系统
     // 按菜单栏深浅色自动着色,与原生菜单栏图标同一视觉语言
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
@@ -501,12 +537,105 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_main_window(app),
+            "show" | "pending" => show_main_window(app),
             "quit" => app.exit(0),
             _ => {}
         })
         .build(app)?;
     Ok(())
+}
+
+/// 托盘注意态:有待确认请求时换成带圆点徽标的图标、tooltip 点名、
+/// 菜单加直达入口;处理完复原。托盘与菜单是 AppKit 对象,必须在主线程碰
+#[cfg(target_os = "macos")]
+fn set_tray_attention(app: &tauri::AppHandle, pending: Option<String>) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        let Some(tray) = app.tray_by_id("main") else {
+            return;
+        };
+        let bytes: &[u8] = if pending.is_some() {
+            include_bytes!("../icons/tray-attention.png")
+        } else {
+            include_bytes!("../icons/tray.png")
+        };
+        if let Ok(icon) = tauri::image::Image::from_bytes(bytes) {
+            let _ = tray.set_icon(Some(icon));
+            let _ = tray.set_icon_as_template(true);
+        }
+        let _ = tray.set_tooltip(Some(match &pending {
+            Some(name) => format!("MicSync — 「{name}」等待确认"),
+            None => "MicSync".into(),
+        }));
+        if let Ok(menu) = tray_menu(&app, pending.as_deref()) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    });
+}
+
+/// 系统通知:只在主窗不可见(常驻托盘)时发——窗口在前台时弹窗本身就是提醒。
+/// 通知权限第一次真正要用时才申请,不在启动时骚扰;被拒绝就靠托盘徽标兜底
+#[cfg(desktop)]
+fn notify_pending(app: &tauri::AppHandle, name: &str, kind: &str) {
+    use tauri::Manager as _;
+    use tauri_plugin_notification::{NotificationExt, PermissionState};
+    let visible = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    if visible {
+        return;
+    }
+    let n = app.notification();
+    let granted = matches!(n.permission_state(), Ok(PermissionState::Granted))
+        || matches!(n.request_permission(), Ok(PermissionState::Granted));
+    if !granted {
+        return;
+    }
+    let body = if kind == "authorize" {
+        "对方开启了自动跟随,请求预先授权;同意之前不会开麦,不急。点击菜单栏的 MicSync 图标处理。"
+    } else {
+        "30 秒内未处理将自动拒绝。点击菜单栏的 MicSync 图标处理。"
+    };
+    let _ = n
+        .builder()
+        .title(format!("「{name}」想使用这台设备的麦克风"))
+        .body(body)
+        .show();
+}
+
+/// 待确认请求的哨兵:服务端常驻托盘时,同意弹窗渲染在隐藏窗口里,用户毫无
+/// 感知(macOS 还会节流隐藏 WebView 的定时器,前端轮询靠不住)。这里在 Rust
+/// 侧轮询 pending,出现沿换托盘徽标 + 发系统通知,消失沿复原。
+/// 轮询而不是回调:server 模块不该依赖 tauri
+#[cfg(desktop)]
+fn spawn_pending_watcher(app: tauri::AppHandle) {
+    use tauri::Manager as _;
+    let _ = std::thread::Builder::new()
+        .name("pending-watch".into())
+        .spawn(move || {
+            let mut last: Option<(String, String)> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let now = {
+                    let state = app.state::<AppState>();
+                    let guard = state.server.lock().unwrap();
+                    guard
+                        .as_ref()
+                        .and_then(|h| h.pending())
+                        .map(|(name, _addr, kind)| (name, kind.as_str().to_string()))
+                };
+                if now == last {
+                    continue;
+                }
+                #[cfg(target_os = "macos")]
+                set_tray_attention(&app, now.as_ref().map(|(n, _)| n.clone()));
+                if let Some((name, kind)) = &now {
+                    notify_pending(&app, name, kind);
+                }
+                last = now;
+            }
+        });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -519,6 +648,9 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         show_main_window(app);
     }));
+    // 系统通知:待确认请求出现而主窗又不可见时,靠它提醒用户
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_notification::init());
     let builder = builder
         .manage(AppState::default())
         .setup(|app| {
@@ -534,6 +666,9 @@ pub fn run() {
             ios::setup_audio_session();
             #[cfg(target_os = "macos")]
             setup_tray(app)?;
+            // 待确认请求的托盘徽标与系统通知(常驻托盘时弹窗没人看得见)
+            #[cfg(desktop)]
+            spawn_pending_watcher(app.handle().clone());
             // 恢复上次退出时的形态:上次服务开着(且不是以客户端模式退出)
             // 才自动监听。新装用户不自动开服务——装上就默默被局域网发现,
             // 对只想用别人麦克风的用户是意外行为。监听依旧不碰麦克风,

@@ -21,14 +21,19 @@ pub const END_PREEMPTED: u32 = 1;
 /// 太长会把对方的客户端吊死在那里——30 秒够按一下弹窗了
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 预授权(配对)请求不设裁决时限——不占麦克风,挂到用户处理为止无害。
+/// 但对方一旦不在了(关掉跟随/退出应用/休眠)就该自动撤销,否则弹窗和
+/// Busy 会永远挂着。对方等待期间每 ~2 秒发一个心跳字节,这么久没心跳视为放弃
+const AUTHORIZE_ABANDON: Duration = Duration::from_secs(15);
+
 /// 采集启动器:为一次串流会话按需启动 mic 采集(采集流驻留在自己的线程里,
 /// 停止信号置位后释放麦克风),返回 (实际设备名, 采样率)。
 /// 抽象成函数指针以便测试注入假采集,不依赖真实声卡。
 type CaptureFn = fn(
-    Option<String>,              // 设备偏好
-    Arc<AtomicBool>,             // 本会话采集停止信号
-    SyncSender<Arc<Vec<i16>>>,   // 帧输出
-    Arc<audio::LevelMeter>,      // 电平/波形上报
+    Option<String>,            // 设备偏好
+    Arc<AtomicBool>,           // 本会话采集停止信号
+    SyncSender<Arc<Vec<i16>>>, // 帧输出
+    Arc<audio::LevelMeter>,    // 电平/波形上报
 ) -> Result<(String, u32), String>;
 
 /// 当前串流会话;同一时间最多一个,新请求会接管(抢占)旧会话
@@ -49,13 +54,38 @@ pub enum Decision {
     Deny,
 }
 
+/// 授权请求的种类:决定确认弹窗的文案——同意后立即开麦,
+/// 还是自动跟随的预授权(先同意,之后用到时才开麦)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReqKind {
+    Stream,
+    Authorize,
+}
+
+impl ReqKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReqKind::Stream => "stream",
+            ReqKind::Authorize => "authorize",
+        }
+    }
+}
+
 /// 一个正在等用户确认的授权请求
 struct Pending {
     id: u64,
     /// 对方自报的设备名(不可信输入,已过滤控制字符并限长)
     name: String,
     addr: SocketAddr,
+    kind: ReqKind,
     decided: SyncSender<Decision>,
+}
+
+/// 预授权时用户选「允许一次」留下的一次性放行券:同一设备(IP+名字)的
+/// 下一次 /stream 直接放行并作废,再往后仍要重新确认——「一次」就是一轮使用
+struct OnceGrant {
+    ip: std::net::IpAddr,
+    name: String,
 }
 
 struct Shared {
@@ -64,6 +94,8 @@ struct Shared {
     session: Mutex<Option<Session>>,
     /// 等待用户确认的授权请求;同一时间最多一个
     pending: Mutex<Option<Pending>>,
+    /// 预授权「允许一次」的一次性放行券;同一时间最多一张
+    once_grant: Mutex<Option<OnceGrant>>,
     next_id: AtomicU64,
     meter: Arc<audio::LevelMeter>,
     /// 最近一次采集的实际设备名与采样率(状态展示)
@@ -126,14 +158,14 @@ impl ServerHandle {
         self.shared.error.lock().unwrap().clone()
     }
 
-    /// 当前等待用户确认的授权请求 (设备名, 来源地址);None = 没有待确认的
-    pub fn pending(&self) -> Option<(String, String)> {
+    /// 当前等待用户确认的授权请求 (设备名, 来源地址, 种类);None = 没有待确认的
+    pub fn pending(&self) -> Option<(String, String, ReqKind)> {
         self.shared
             .pending
             .lock()
             .unwrap()
             .as_ref()
-            .map(|p| (p.name.clone(), p.addr.to_string()))
+            .map(|p| (p.name.clone(), p.addr.to_string(), p.kind))
     }
 
     /// 用户裁决当前的授权请求;没有待确认请求时静默忽略(UI 可能慢一拍)
@@ -196,6 +228,7 @@ fn start_with(
         device_pref: Mutex::new(device_name),
         session: Mutex::new(None),
         pending: Mutex::new(None),
+        once_grant: Mutex::new(None),
         next_id: AtomicU64::new(1),
         meter: Arc::new(audio::LevelMeter::new()),
         last_device: Mutex::new(String::new()),
@@ -240,7 +273,12 @@ fn accept_thread(listener: TcpListener, stop: Arc<AtomicBool>, shared: Arc<Share
     }
 }
 
-fn handle_conn(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
+fn handle_conn(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
@@ -252,7 +290,12 @@ fn handle_conn(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>, s
     let path = match parse_request_path(&head) {
         Some(p) => p,
         None => {
-            let _ = write_http(&mut stream, 400, "Bad Request", r#"{"error":"bad_request"}"#);
+            let _ = write_http(
+                &mut stream,
+                400,
+                "Bad Request",
+                r#"{"error":"bad_request"}"#,
+            );
             graceful_close(stream);
             return;
         }
@@ -287,6 +330,7 @@ fn handle_conn(mut stream: TcpStream, addr: SocketAddr, stop: Arc<AtomicBool>, s
             graceful_close(stream);
         }
         "/stream" => handle_stream(stream, addr, &head, stop, shared),
+        "/authorize" => handle_authorize(stream, addr, &head, stop, shared),
         _ => {
             let _ = write_http(&mut stream, 404, "Not Found", r#"{"error":"not_found"}"#);
             graceful_close(stream);
@@ -318,7 +362,17 @@ enum Consent {
 
 /// 授权闸门:已信任的客户端直接放行,否则挂起请求交给用户裁决。
 /// 这一步必须在认领会话与开麦之前——没同意之前不能碰麦克风。
-fn await_consent(shared: &Arc<Shared>, name: &str, addr: SocketAddr, stop: &AtomicBool) -> Consent {
+/// probe:预授权请求的连接。/stream 的确认吊着即将串流的连接,30 秒不决作罢;
+/// 预授权不设时限,靠在 probe 上收心跳字节判断对方还在不在等——
+/// 断开(EOF)或心跳断绝都视为放弃,当场撤销请求
+fn await_consent(
+    shared: &Arc<Shared>,
+    name: &str,
+    addr: SocketAddr,
+    kind: ReqKind,
+    stop: &AtomicBool,
+    mut probe: Option<&mut TcpStream>,
+) -> Consent {
     let (tx, rx) = sync_channel::<Decision>(1);
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     {
@@ -330,21 +384,52 @@ fn await_consent(shared: &Arc<Shared>, name: &str, addr: SocketAddr, stop: &Atom
             id,
             name: name.to_string(),
             addr,
+            kind,
             decided: tx,
         });
     }
 
-    // 分段等待:既能到点超时,也能在服务停止时立刻收手
-    let deadline = std::time::Instant::now() + CONSENT_TIMEOUT;
+    let deadline = match kind {
+        ReqKind::Stream => Some(std::time::Instant::now() + CONSENT_TIMEOUT),
+        ReqKind::Authorize => None,
+    };
+    if let Some(s) = probe.as_deref_mut() {
+        let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+    }
+    let mut last_heartbeat = std::time::Instant::now();
+
+    // 分段等待:既能到点超时/察觉对方放弃,也能在服务停止时立刻收手
     let outcome = loop {
         if stop.load(Ordering::SeqCst) {
             break None;
         }
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            break None;
+        let wait = match deadline {
+            Some(d) => {
+                let left = d.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break None;
+                }
+                left.min(Duration::from_millis(200))
+            }
+            None => Duration::from_millis(200),
+        };
+        if let Some(s) = probe.as_deref_mut() {
+            let mut buf = [0u8; 16];
+            match s.read(&mut buf) {
+                Ok(0) => break None, // 对方断开:放弃
+                Ok(_) => last_heartbeat = std::time::Instant::now(),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break None,
+            }
+            if last_heartbeat.elapsed() >= AUTHORIZE_ABANDON {
+                break None; // 心跳断绝(对方休眠/网络消失):放弃
+            }
         }
-        match rx.recv_timeout(left.min(Duration::from_millis(200))) {
+        match rx.recv_timeout(wait) {
             Ok(d) => break Some(d),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             // 发送端被丢弃(如 stop 里 take 走了):当作拒绝
@@ -369,6 +454,87 @@ fn await_consent(shared: &Arc<Shared>, name: &str, addr: SocketAddr, stop: &Atom
     }
 }
 
+/// 预授权(配对):只走同意闸门,不开麦。自动跟随在武装时调用,把「要不要让
+/// 对方用我的麦克风」的决定从会议开始的瞬间挪到设置跟随的时刻。
+/// 请求挂到用户处理为止(无裁决时限);等待期间对方每 ~2 秒发一个心跳字节,
+/// 断开或心跳断绝视为放弃,自动撤销。响应:
+/// 200 已授权(「始终允许」附带 X-MicSync-Token;「允许一次」发一张一次性放行券) /
+/// 403 拒绝(终态,对方不得自动重试) / 409 另一请求正在等确认(对方稍后重试)
+fn handle_authorize(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    head: &str,
+    stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+) {
+    let token = header_value(head, "x-micsync-token");
+    let name = settings::sanitize_name(&header_value(head, "x-micsync-name"));
+    let name = if name.is_empty() {
+        format!("未命名设备({})", addr.ip())
+    } else {
+        name
+    };
+
+    if settings::trusted_by_token(&token, &name) {
+        let _ = write_authorized(&mut stream, None);
+        graceful_close(stream);
+        return;
+    }
+
+    match await_consent(
+        &shared,
+        &name,
+        addr,
+        ReqKind::Authorize,
+        &stop,
+        Some(&mut stream),
+    ) {
+        Consent::Allowed(issued) => {
+            if issued.is_none() {
+                // 「允许一次」:发一张一次性放行券,对方下一轮 /stream 免确认;
+                // 那之后再用仍会重新弹确认——「一次」就是一轮使用
+                *shared.once_grant.lock().unwrap() = Some(OnceGrant {
+                    ip: addr.ip(),
+                    name: name.clone(),
+                });
+            }
+            let _ = write_authorized(&mut stream, issued.as_deref());
+        }
+        Consent::Denied => {
+            let _ = write_http(
+                &mut stream,
+                403,
+                "Forbidden",
+                r#"{"error":"denied","message":"对方拒绝了自动跟随的授权请求"}"#,
+            );
+        }
+        // 预授权没有时限,走到这里只可能是对方已放弃或服务停止——没有可靠的
+        // 收件人,不用回什么了
+        Consent::Timeout => {}
+        Consent::Busy => {
+            let _ = write_http(
+                &mut stream,
+                409,
+                "Conflict",
+                r#"{"error":"busy","message":"另一台设备的请求正在等待确认,请稍后重试"}"#,
+            );
+        }
+    }
+    graceful_close(stream);
+}
+
+/// 消费「允许一次」的放行券:同一设备(IP+名字)的下一次 /stream 直接放行并作废
+fn consume_once_grant(shared: &Shared, addr: &SocketAddr, name: &str) -> bool {
+    let mut g = shared.once_grant.lock().unwrap();
+    if g.as_ref()
+        .map_or(false, |o| o.ip == addr.ip() && o.name == name)
+    {
+        *g = None;
+        return true;
+    }
+    false
+}
+
 fn handle_stream(
     mut stream: TcpStream,
     addr: SocketAddr,
@@ -387,8 +553,8 @@ fn handle_stream(
     };
 
     let mut issued_token = None;
-    if !settings::trusted_by_token(&token, &name) {
-        match await_consent(&shared, &name, addr, &stop) {
+    if !settings::trusted_by_token(&token, &name) && !consume_once_grant(&shared, &addr, &name) {
+        match await_consent(&shared, &name, addr, ReqKind::Stream, &stop, None) {
             Consent::Allowed(t) => issued_token = t,
             Consent::Denied => {
                 let _ = write_http(
@@ -712,9 +878,34 @@ fn parse_request_path(head: &str) -> Option<String> {
     Some(path.split('?').next().unwrap_or(path).to_string())
 }
 
-fn write_http(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::io::Result<()> {
+/// 预授权通过的 200 响应;「始终允许」时把签发的令牌随响应头交给对方
+fn write_authorized(stream: &mut TcpStream, token: Option<&str>) -> std::io::Result<()> {
+    let body = r#"{"status":"ok"}"#;
+    let token_header = token
+        .map(|t| format!("X-MicSync-Token: {t}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{token_header}Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())
+}
+
+fn write_http(stream: &mut TcpStream, code: u16, reason: &str, body: &str) -> std::io::Result<()> {
+    write_http_ex(stream, code, reason, "", body)
+}
+
+/// 同 write_http,但可附加额外响应头(如签发令牌);extra 每行须以 \r\n 结尾
+fn write_http_ex(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    extra: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -795,9 +986,12 @@ mod tests {
         let mut buf = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            stream
-                .read_exact(&mut byte)
-                .unwrap_or_else(|e| panic!("读响应头失败({e:?});已读到 {:?}", String::from_utf8_lossy(&buf)));
+            stream.read_exact(&mut byte).unwrap_or_else(|e| {
+                panic!(
+                    "读响应头失败({e:?});已读到 {:?}",
+                    String::from_utf8_lossy(&buf)
+                )
+            });
             buf.push(byte[0]);
             if buf.ends_with(b"\r\n\r\n") {
                 break;
@@ -858,7 +1052,11 @@ mod tests {
         let port = handle.port;
 
         // 空闲:不开麦,health 报告空闲
-        assert_eq!(ACTIVE_CAPTURES.load(Ordering::SeqCst), 0, "mic must be off when idle");
+        assert_eq!(
+            ACTIVE_CAPTURES.load(Ordering::SeqCst),
+            0,
+            "mic must be off when idle"
+        );
         let mut c = http_get(port, "/health");
         let mut resp = String::new();
         c.read_to_string(&mut resp).expect("health");
@@ -871,7 +1069,10 @@ mod tests {
         let mut magic = [0u8; 12];
         c1.read_exact(&mut magic).expect("MSY1 header");
         assert_eq!(&magic[0..4], MAGIC);
-        assert_eq!(u32::from_le_bytes([magic[4], magic[5], magic[6], magic[7]]), 44100);
+        assert_eq!(
+            u32::from_le_bytes([magic[4], magic[5], magic[6], magic[7]]),
+            44100
+        );
         let frame = read_frame(&mut c1).expect("should receive audio");
         assert_eq!(frame.len(), 441);
         assert!(
@@ -979,7 +1180,7 @@ mod tests {
     }
 
     /// 等到出现待确认请求;超时返回 None
-    fn wait_pending(h: &ServerHandle, ms: u64) -> Option<(String, String)> {
+    fn wait_pending(h: &ServerHandle, ms: u64) -> Option<(String, String, ReqKind)> {
         let mut waited = 0;
         while waited < ms {
             if let Some(p) = h.pending() {
@@ -1129,12 +1330,8 @@ mod tests {
         let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let handle = start_with(None, 0, fake_capture).expect("start");
         // 名字里塞控制字符与超长内容
-        let _c = http_get_with(
-            handle.port,
-            "/stream",
-            "X-MicSync-Name: 坏\u{7}设备\r\n",
-        );
-        let (name, _) = wait_pending(&handle, 2000).expect("应出现待确认请求");
+        let _c = http_get_with(handle.port, "/stream", "X-MicSync-Name: 坏\u{7}设备\r\n");
+        let (name, _, _) = wait_pending(&handle, 2000).expect("应出现待确认请求");
         assert!(!name.contains('\u{7}'), "控制字符应被滤掉: {name:?}");
         assert!(name.chars().count() <= 40, "名字应限长");
         handle.stop();
@@ -1146,9 +1343,153 @@ mod tests {
         let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let handle = start_with(None, 0, fake_capture).expect("start");
         let _c = http_get(handle.port, "/stream");
-        let (name, addr) = wait_pending(&handle, 2000).expect("应出现待确认请求");
+        let (name, addr, _) = wait_pending(&handle, 2000).expect("应出现待确认请求");
         assert!(name.contains("未命名设备"), "got {name}");
         assert!(addr.starts_with("127.0.0.1:"), "got {addr}");
+        handle.stop();
+    }
+
+    // ---------- 预授权 /authorize ----------
+
+    /// /authorize 走同一道确认闸门,但全程不开麦、不占会话——它只是把
+    /// 确认弹窗提前,不是变相开麦
+    #[test]
+    fn authorize_prompts_without_touching_the_mic() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+
+        let mut c = http_get_with(handle.port, "/authorize", "X-MicSync-Name: 跟随的 Mac\r\n");
+        let (name, _, kind) = wait_pending(&handle, 2000).expect("应出现待确认请求");
+        assert_eq!(name, "跟随的 Mac");
+        assert_eq!(kind, ReqKind::Authorize, "弹窗要能区分这是预授权");
+
+        // 等确认期间与拒绝之后,麦克风和会话都必须原封不动
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(ACTIVE_CAPTURES.load(Ordering::SeqCst), 0, "预授权不开麦");
+        assert!(handle.stream_addr().is_none(), "预授权不占会话");
+
+        handle.decide(Decision::Deny);
+        assert_eq!(read_status(&mut c), 403, "拒绝应返回 403");
+        assert_eq!(ACTIVE_CAPTURES.load(Ordering::SeqCst), 0);
+        handle.stop();
+    }
+
+    /// 「始终允许」的预授权签发令牌,之后 /stream 凭令牌直接串流不再弹窗
+    #[test]
+    fn authorize_always_enables_silent_stream_later() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let port = handle.port;
+
+        let mut c = http_get_with(port, "/authorize", "X-MicSync-Name: 跟随的 Mac\r\n");
+        wait_pending(&handle, 2000).expect("应出现待确认请求");
+        handle.decide(Decision::Always);
+        let head = read_test_head(&mut c);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let token = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("x-micsync-token")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("「始终允许」应随响应签发令牌");
+        drop(c);
+
+        let mut c2 = http_get_with(port, "/stream", &format!("X-MicSync-Token: {token}\r\n"));
+        let head2 = read_test_head(&mut c2);
+        assert!(head2.starts_with("HTTP/1.1 200"), "{head2}");
+        assert!(handle.pending().is_none(), "预授权过的设备不该再弹确认");
+        handle.stop();
+    }
+
+    /// 「允许一次」的预授权 = 允许接下来的一轮使用:下一次 /stream 免弹窗,
+    /// 再往后恢复确认——否则那次同意就成了什么都没换来的空头承诺
+    #[test]
+    fn authorize_once_covers_exactly_one_stream() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let port = handle.port;
+
+        let mut c = http_get_with(port, "/authorize", "X-MicSync-Name: 跟随的 Mac\r\n");
+        wait_pending(&handle, 2000).expect("应出现待确认请求");
+        handle.decide(Decision::Once);
+        let head = read_test_head(&mut c);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("x-micsync-token"),
+            "「允许一次」不该签发令牌:{head}"
+        );
+        drop(c);
+
+        // 第一次 /stream(同名同 IP):兑现放行券,直接串流
+        let mut c2 = http_get_with(port, "/stream", "X-MicSync-Name: 跟随的 Mac\r\n");
+        let head2 = read_test_head(&mut c2);
+        assert!(head2.starts_with("HTTP/1.1 200"), "{head2}");
+        assert!(handle.pending().is_none(), "放行券在手不该弹确认");
+        drop(c2);
+
+        // 第二次:券已作废,恢复确认
+        let _c3 = http_get_with(port, "/stream", "X-MicSync-Name: 跟随的 Mac\r\n");
+        assert!(
+            wait_pending(&handle, 2000).is_some(),
+            "「允许一次」只覆盖一轮使用"
+        );
+        handle.stop();
+    }
+
+    /// 放行券绑定设备名:别的名字(可能是另一台机器)不能冒领
+    #[test]
+    fn once_grant_is_not_transferable() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let port = handle.port;
+
+        let mut c = http_get_with(port, "/authorize", "X-MicSync-Name: 甲\r\n");
+        wait_pending(&handle, 2000).expect("应出现待确认请求");
+        handle.decide(Decision::Once);
+        assert_eq!(read_status(&mut c), 200);
+        drop(c);
+
+        let _c2 = http_get_with(port, "/stream", "X-MicSync-Name: 乙\r\n");
+        assert!(
+            wait_pending(&handle, 2000).is_some(),
+            "名字不匹配不能兑现放行券"
+        );
+        handle.stop();
+    }
+
+    /// 预授权的确认没有时限,但对方断开(关掉跟随/退出应用)要立刻
+    /// 撤销待确认请求,弹窗不能永远挂着堵住别人
+    #[test]
+    fn authorize_abandoned_when_client_disconnects() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let c = http_get_with(handle.port, "/authorize", "X-MicSync-Name: 甲\r\n");
+        wait_pending(&handle, 2000).expect("应出现待确认请求");
+        drop(c);
+        assert!(
+            wait_until(|| handle.pending().is_none(), 3000),
+            "对方断开后应撤销待确认请求"
+        );
+        handle.stop();
+    }
+
+    /// 已信任(有令牌)的客户端预授权直接放行,不打扰用户
+    #[test]
+    fn authorize_with_valid_token_returns_immediately() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let token = settings::trust_client("已信任设备");
+        let mut c = http_get_with(
+            handle.port,
+            "/authorize",
+            &format!("X-MicSync-Token: {token}\r\n"),
+        );
+        assert_eq!(read_status(&mut c), 200);
+        assert!(handle.pending().is_none(), "已信任设备不该弹确认");
+        settings::revoke_trusted(&token);
         handle.stop();
     }
 

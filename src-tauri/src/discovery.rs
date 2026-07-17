@@ -471,7 +471,10 @@ mod tests {
         assert!(hosts.contains(&Ipv4Addr::new(192, 168, 1, 1)));
         assert!(hosts.contains(&Ipv4Addr::new(192, 168, 1, 254)));
         assert!(!hosts.contains(&Ipv4Addr::new(192, 168, 1, 10)), "不扫自己");
-        assert!(!hosts.contains(&Ipv4Addr::new(192, 168, 1, 255)), "不扫广播地址");
+        assert!(
+            !hosts.contains(&Ipv4Addr::new(192, 168, 1, 255)),
+            "不扫广播地址"
+        );
     }
 
     /// 起一个假 /health 服务,验证探测能认出 MicSync 并带回 alias
@@ -537,7 +540,12 @@ mod tests {
         let port = spawn_fake_health(r#"{"status":"ok","app":"micsync","streaming":false}"#);
         let mine = [Ipv4Addr::LOCALHOST];
         assert!(
-            probe_health(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), "my-fp", &mine).is_none(),
+            probe_health(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                "my-fp",
+                &mine
+            )
+            .is_none(),
             "本机 IP 上的老版本服务端就是自己"
         );
     }

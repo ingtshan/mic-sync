@@ -249,7 +249,10 @@ mod tests {
     fn probe_micuse() {
         let t0 = Instant::now();
         let dev = find_monitor_target("BlackHole 2ch");
-        println!("[{:?}] find_monitor_target(BlackHole 2ch) = {dev:?}", t0.elapsed());
+        println!(
+            "[{:?}] find_monitor_target(BlackHole 2ch) = {dev:?}",
+            t0.elapsed()
+        );
         if let Some(dev) = dev {
             let t1 = Instant::now();
             let usage = other_process_capturing(&dev);

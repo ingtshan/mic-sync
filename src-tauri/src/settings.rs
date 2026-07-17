@@ -290,7 +290,11 @@ pub fn remember_server(server_id: &str, token: &str, name: &str) {
         return;
     }
     let mut g = cell().lock().unwrap();
-    if let Some(existing) = g.known_servers.iter_mut().find(|s| s.server_id == server_id) {
+    if let Some(existing) = g
+        .known_servers
+        .iter_mut()
+        .find(|s| s.server_id == server_id)
+    {
         existing.token = token.to_string();
         existing.name = sanitize_name(name);
     } else {
@@ -312,7 +316,10 @@ mod tests {
         // 换行会破坏 HTTP 头,必须滤掉
         assert_eq!(sanitize_name("我的\r\nMac"), "我的Mac");
         assert_eq!(sanitize_name("  张三的 Mac  "), "张三的 Mac");
-        assert_eq!(sanitize_name(&"啊".repeat(100)).chars().count(), MAX_NAME_LEN);
+        assert_eq!(
+            sanitize_name(&"啊".repeat(100)).chars().count(),
+            MAX_NAME_LEN
+        );
         assert_eq!(sanitize_name("\u{0}\u{7}"), "");
     }
 

@@ -31,8 +31,7 @@ pub fn setup_audio_session() {
         if let Err(e) = set_cat {
             eprintln!("AVAudioSession setCategory 失败: {e}");
         }
-        let activate: Result<(), Retained<NSError>> =
-            msg_send![session, setActive: true, error: _];
+        let activate: Result<(), Retained<NSError>> = msg_send![session, setActive: true, error: _];
         if let Err(e) = activate {
             eprintln!("AVAudioSession setActive 失败: {e}");
         }
