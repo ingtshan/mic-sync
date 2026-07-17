@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>MicSync 需要访问麦克风,以便将声音共享给局域网内的其他电脑。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>MicSync 需要访问局域网,以便在电脑之间传输麦克风音频。</string>
+</dict>
+</plist>

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MicSync</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="logo">🎙️</div>
+    <div>
+      <h1>MicSync</h1>
+      <p class="subtitle">一个麦克风,多台电脑共享</p>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button id="tab-server" class="tab active">📡 服务端(有麦克风)</button>
+    <button id="tab-client" class="tab">💻 客户端(用麦克风)</button>
+  </nav>
+
+  <!-- ============ 服务端面板 ============ -->
+  <main id="panel-server" class="panel">
+    <section class="card">
+      <label class="field-label" for="input-device">麦克风设备</label>
+      <select id="input-device"></select>
+
+      <label class="field-label" for="server-port">监听端口</label>
+      <input id="server-port" type="number" value="47800" min="1024" max="65535" />
+
+      <button id="btn-server-toggle" class="btn primary">▶ 启动共享</button>
+    </section>
+
+    <section id="server-info" class="card hidden">
+      <div class="status-row">
+        <span class="dot green"></span>
+        <span id="server-summary">运行中</span>
+      </div>
+      <div class="level-wrap">
+        <div class="level-label">输入电平</div>
+        <div class="level-bar"><div id="server-level" class="level-fill"></div></div>
+      </div>
+      <div class="info-grid">
+        <div><span class="k">麦克风状态</span><span id="server-mic" class="v">静音待机</span></div>
+        <div><span class="k">采样率</span><span id="server-rate" class="v">—</span></div>
+      </div>
+      <div class="status-row">
+        <span id="stream-dot" class="dot gray"></span>
+        <span id="server-stream">串流空闲 · 等待客户端认领</span>
+      </div>
+      <div class="ip-section">
+        <div class="k">客户端连接地址(本机 IP)</div>
+        <div id="server-ips" class="ip-list"></div>
+      </div>
+    </section>
+
+    <p id="server-error" class="error hidden"></p>
+  </main>
+
+  <!-- ============ 客户端面板 ============ -->
+  <main id="panel-client" class="panel hidden">
+    <div id="blackhole-banner" class="banner hidden">
+      <strong>⚠️ 未检测到 BlackHole 虚拟声卡</strong>
+      <p>客户端需要 BlackHole 才能把远端麦克风虚拟成本机麦克风。请前往官网下载图形安装器(推荐,免费,需填邮箱获取下载链接),下载后双击 .pkg 按提示完成安装:</p>
+      <button id="btn-download-blackhole" class="btn small accent">⬇ 前往官网下载 BlackHole 2ch</button>
+      <p class="hint">备选方式 · Homebrew(注意:若跳过密码授权会静默失败,装完务必核对):</p>
+      <code id="brew-cmd">brew install blackhole-2ch</code>
+      <button id="btn-copy-brew" class="btn small">复制命令</button>
+      <p class="hint">⚠️ 安装完成后需要<strong>重启电脑</strong>(或在终端执行 <code class="inline">sudo killall coreaudiod</code> 重启音频服务),BlackHole 才会生效。生效后本提示会自动消失,之后在其他软件里选择「BlackHole 2ch」作为麦克风即可。</p>
+    </div>
+
+    <section class="card">
+      <label class="field-label" for="server-addr">服务端地址</label>
+      <input id="server-addr" type="text" placeholder="例如 192.168.1.10 或 192.168.1.10:47800" />
+
+      <label class="field-label" for="output-device">输出到(选 BlackHole 即虚拟麦克风)</label>
+      <select id="output-device"></select>
+
+      <button id="btn-client-toggle" class="btn primary">👂 开始监听</button>
+      <p class="hint">开始监听后不会持续占用带宽:只有服务端麦克风有人说话时才自动拉取音频,说完自动回到待机。</p>
+    </section>
+
+    <section id="client-info" class="card hidden">
+      <div class="status-row">
+        <span id="client-dot" class="dot green"></span>
+        <span id="client-summary">已连接</span>
+      </div>
+      <div class="level-wrap">
+        <div class="level-label">接收电平</div>
+        <div class="level-bar"><div id="client-level" class="level-fill"></div></div>
+      </div>
+      <div class="info-grid">
+        <div><span class="k">缓冲</span><span id="client-buffer" class="v">0 ms</span></div>
+        <div><span class="k">源采样率</span><span id="client-rate" class="v">—</span></div>
+      </div>
+      <p class="hint">✅ 现在在 Zoom / 微信 / 腾讯会议等应用中选择「BlackHole 2ch」作为麦克风即可。</p>
+    </section>
+
+    <p id="client-error" class="error hidden"></p>
+  </main>
+
+  <footer class="app-footer">局域网低延迟传输 · 语音激活按需串流 · PCM 16bit 单声道</footer>
+
+  <script src="main.js"></script>
+</body>
+</html>
