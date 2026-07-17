@@ -1,81 +1,122 @@
 # MicSync 🎙️
 
-**一个麦克风,多台 Mac 共享。** 麦克风物理接在一台电脑(服务端)上,局域网内其他电脑(客户端)通过虚拟声卡把它当成本机麦克风使用——无需来回插拔切换。
+**English** | [简体中文](README.zh-CN.md)
 
-服务端只做监听,客户端事件驱动:平时没有任何音频流,**说话触发语音激活(VAD)后,客户端才通过 API 自动拉起串流**;同一时间只允许一条串流存在(多台设备串行共享同一个麦克风)。
+**One microphone, shared across every Mac on your LAN.** The mic is physically plugged into one computer (the server); other computers (clients) on the local network use it as their own microphone through a virtual audio device — no more re-plugging cables.
+
+## Why MicSync
+
+Anyone with more than one Mac on their desk runs into the same annoyance: **there's only one good microphone**.
+
+- Today's meeting is on the work MacBook, tomorrow's is on the personal Mac mini — the mic has to follow you around; frequently re-plugging a USB mic or audio interface is tedious and wears out ports
+- The moment a Bluetooth headset enables its mic, audio quality drops to "phone call" level (HFP profile) — no headset can escape that
+- macOS Continuity can only use an **iPhone** as a microphone; it cannot borrow the mic from another **Mac**
+- Existing network-audio solutions (NDI, Dante, etc.) are heavyweight or paid, and most of them **stream continuously** — burning bandwidth and CPU even when nobody is talking
+
+MicSync solves exactly one small problem: **make the microphone attached to one Mac appear as a "local microphone" on every other Mac in the LAN**. And it stays quiet: zero audio traffic while nobody speaks, connects the instant you talk, and disconnects when you stop.
+
+## Use cases
+
+- **Two-Mac desk setup**: a work MacBook and a personal desktop Mac share one desk; the mic is plugged into one of them. When the other needs to join a meeting, just select BlackHole as the input — zero re-plugging
+- **Rotating between Macs for meetings**: the same person joins calls from different Macs (switching between company and client environments); all clients stay listening in standby, and whichever Mac you sit at just works — voice-triggered, no manual switching
+- **Sharing a high-quality recording chain**: a condenser mic + audio interface lives on your recording/streaming rig; the Mac next to it can borrow that chain's sound for an impromptu call
+- **Multi-device standby without double audio**: multiple clients can listen to the same server simultaneously, but only one receives the stream at a time (first come, first served, serial rotation) — the same voice never gets fed into two meetings at once
+
+## Device topology
+
+One **server Mac** (where the physical microphone lives) + N **client Macs**, all on the same LAN, in a star topology. Each client installs the [BlackHole](https://existential.audio/blackhole/) loopback driver as its "virtual microphone" outlet:
 
 ```
-┌─ 服务端 Mac ─────────────────┐         ┌─ 客户端 Mac × N ─────────────────────┐
-│ 真实麦克风(持续采集只做检测)  │  HTTP   │ 轮询 GET /health(服务是否可用、       │
-│   ↓ 语音激活 VAD             │←────────│ mic 是否激活、串流是否被占用)          │
-│ 说话 → 激活;静音 1.5s → 收流 │         │   ↓ 激活且空闲时                      │
-│                              │  HTTP   │ GET /stream 认领串流(全局唯一,       │
-│ PCM 16bit 单声道帧            ├────────→│ 被占返回 409)                        │
-│                              │  局域网  │   ↓ 重采样 + 抖动缓冲                 │
-└──────────────────────────────┘         │ 播放到 BlackHole(回环虚拟声卡)        │
+                        LAN (same subnet)
+                              │
+              ┌───────────────┴───────────────┐
+              │         Server Mac × 1        │
+              │  🎙️ physical mic (USB/built-in)│
+              │  MicSync "Server" :47800       │
+              └───────────────┬───────────────┘
+    GET /health poll (250ms)  │  GET /stream (exclusive; 409 if taken)
+       ┌──────────────┬───────┴───────┬──────────────┐
+       │ Client Mac A │ Client Mac B  │ Client Mac C │
+       │ BlackHole    │ BlackHole     │ BlackHole    │
+       │ → Zoom       │ → WeChat      │ → Teams      │
+       └──────────────┴───────────────┴──────────────┘
+        Only one client holds the stream at any moment
+```
+
+The server only listens; clients are event-driven. There is no audio flow at rest — **voice activity detection (VAD) on the server triggers clients to pull the stream automatically via the API**; after 1.5 s of silence the stream ends and everyone returns to standby. Data flow in detail:
+
+```
+┌─ Server Mac ─────────────────┐         ┌─ Client Mac × N ─────────────────────┐
+│ real mic (captured locally   │  HTTP   │ poll GET /health (is service up?     │
+│ for detection only)          │←────────│ mic active? stream slot taken?)      │
+│   ↓ voice activation (VAD)   │         │   ↓ when active and slot free        │
+│ speak → active;              │  HTTP   │ GET /stream claims the exclusive     │
+│ 1.5s silence → stream ends   ├────────→│ stream (409 if already taken)        │
+│ PCM 16-bit mono frames       │  LAN    │   ↓ resample + jitter buffer         │
+└──────────────────────────────┘         │ play into BlackHole (loopback)       │
                                          │   ↓                                  │
-                                         │ Zoom/微信/会议软件选 "BlackHole 2ch"  │
-                                         │ 作为麦克风 ✓                          │
+                                         │ Zoom/WeChat/any meeting app selects  │
+                                         │ "BlackHole 2ch" as microphone ✓      │
                                          └──────────────────────────────────────┘
 ```
 
-## 使用方法
+## How to use
 
-### 服务端(麦克风所在的电脑)
+### Server (the Mac with the microphone)
 
-1. 打开 MicSync,切到「📡 服务端」标签
-2. 选择要共享的麦克风,点「启动共享」
-3. 把界面上显示的 `IP:端口` 告诉客户端(点击即可复制)
+1. Open MicSync and switch to the "📡 Server" tab
+2. Pick the microphone to share and click "Start sharing"
+3. Tell the clients the `IP:port` shown in the UI (click to copy)
 
-### 客户端(想用这个麦克风的电脑)
+### Client (the Mac that wants to use that microphone)
 
-1. 安装 BlackHole 虚拟声卡(一次性,应用内有引导按钮):
-   - **推荐**:前往官网 <https://existential.audio/blackhole/> 免费获取图形安装器(需填邮箱),下载后双击 `.pkg` 按提示安装——图形安装器会强制走完管理员授权,不会静默失败
-   - 备选:`brew install blackhole-2ch`(注意:若安装过程中 sudo 授权未完成,brew 可能显示"已安装"但驱动实际没装上;可用 `ls /Library/Audio/Plug-Ins/HAL/` 核对是否存在 `BlackHole2ch.driver`)
+1. Install the BlackHole virtual audio driver (one-time; the app has a guided button):
+   - **Recommended**: get the free graphical installer from <https://existential.audio/blackhole/> (email required), then double-click the `.pkg` and follow the prompts — the GUI installer forces the admin authorization through and cannot fail silently
+   - Alternative: `brew install blackhole-2ch` (note: if the sudo prompt is not completed during install, brew may report "installed" while the driver actually isn't; verify with `ls /Library/Audio/Plug-Ins/HAL/` and check that `BlackHole2ch.driver` exists)
 
-   > ⚠️ 安装完成后需要**重启电脑**(或执行 `sudo killall coreaudiod` 重启音频服务),BlackHole 才会出现在设备列表中。
-2. 打开 MicSync,切到「💻 客户端」标签
-3. 填服务端地址,输出设备选 **BlackHole 2ch**,点「开始监听」
-4. 在任意应用(Zoom / 微信 / 腾讯会议…)里把麦克风选为 **BlackHole 2ch**
+   > ⚠️ After installation, **restart the Mac** (or run `sudo killall coreaudiod` to restart the audio service) before BlackHole shows up in the device list.
+2. Open MicSync and switch to the "💻 Client" tab
+3. Enter the server address, choose **BlackHole 2ch** as the output device, and click "Start listening"
+4. In any app (Zoom / WeChat / Teams…), select **BlackHole 2ch** as the microphone
 
-「开始监听」后客户端处于待机:服务端麦克风检测到说话才自动开始收流,说完(静音 1.5 秒)自动结束、回到待机。多台客户端可以同时监听同一个服务端,但**同一时间只有一台在收流**(先到先得,串行轮转),避免一份人声被多台设备同时送进会议。服务端中途重启也不用管,客户端会自动重连。
+After "Start listening" the client sits in standby: streaming starts automatically when the server mic detects speech, and stops (after 1.5 s of silence) back to standby. Multiple clients can listen to the same server, but **only one receives the stream at a time** (first come, first served, serial rotation), so the same voice is never fed into a meeting from two machines. If the server restarts mid-way, clients reconnect automatically.
 
 ## HTTP API
 
-服务端在监听端口上提供两个接口(默认 `47800`):
+The server exposes two endpoints on its listening port (default `47800`):
 
-| 接口 | 说明 |
+| Endpoint | Description |
 | --- | --- |
-| `GET /health` | 探活 + 状态:`{"status":"ok","app":"micsync","sample_rate":48000,"device":"...","mic_active":false,"streaming":false}` |
-| `GET /stream` | 认领唯一串流。成功返回 `200`(`application/octet-stream`,正文为 `MSY1` 头 + PCM 帧,直到静音收流);mic 未激活或槽位被占返回 `409` |
+| `GET /health` | Liveness + status: `{"status":"ok","app":"micsync","sample_rate":48000,"device":"...","mic_active":false,"streaming":false}` |
+| `GET /stream` | Claim the exclusive stream. On success returns `200` (`application/octet-stream`, body is an `MSY1` header + PCM frames until silence ends the stream); returns `409` if the mic is inactive or the slot is taken |
 
-## 开发
+## Development
 
 ```bash
-# 开发运行(需要 Rust;前端为纯静态页面,无需 npm install)
+# Dev run (requires Rust; the frontend is pure static pages, no npm install needed)
 npx @tauri-apps/cli@latest dev
 
-# 打包 .app / .dmg
+# Build .app / .dmg
 npx @tauri-apps/cli@latest build
-# 产物在 src-tauri/target/release/bundle/
+# Artifacts land in src-tauri/target/release/bundle/
 ```
 
-首次运行服务端时 macOS 会弹出麦克风权限请求;客户端首次连接会弹出局域网访问权限请求,均需允许。
+On first run the server triggers macOS's microphone-permission prompt; a client's first connection triggers the local-network-permission prompt. Allow both.
 
-## 技术要点
+## Technical notes
 
-- **Tauri 2** + 纯静态前端(无 Node 依赖)
-- **cpal** 做音频采集/播放(CoreAudio)
-- 极简 HTTP 服务(std 手写,无框架):`/health` 探活 + `/stream` 串流,流正文为 `MSY1` 魔数头 + 长度前缀 PCM i16 帧,`TCP_NODELAY` 低延迟
-- **语音激活(VAD)**:峰值电平 ≥ 0.03 激活,静音 1.5s 后退出激活并自动收流;激活起点起服务端缓存 300ms 音频,客户端认领时回补,不丢第一个字
-- **单串流槽位**:同一时间只有一个客户端能拿到 `/stream`,其余轮询待机,槽位释放后先到先得
-- 客户端 60ms 起播水位 + 300ms 缓冲上限(超限丢旧数据保延迟),流式线性重采样兼容任意采样率组合
-- 串流期间带宽约 0.8 Mbps(48kHz · 16bit · 单声道);待机期间只有每 250ms 一次的 /health 轮询,几乎为零
-- 虚拟麦克风由 [BlackHole](https://github.com/ExistentialAudio/BlackHole) 回环驱动提供;自研 CoreAudio HAL 驱动(免装 BlackHole)列为后续方向
+- **Tauri 2** + pure static frontend (no Node dependency)
+- **cpal** for audio capture/playback (CoreAudio)
+- Minimal HTTP server (hand-written on std, no framework): `/health` liveness + `/stream` streaming; stream body is an `MSY1` magic header + length-prefixed PCM i16 frames, `TCP_NODELAY` for low latency
+- **Voice activation (VAD)**: peak level ≥ 0.03 activates; 1.5 s of silence deactivates and ends the stream; from the moment of activation the server buffers 300 ms of audio and backfills it when a client claims the stream, so the first syllable is never lost
+- **Single stream slot**: only one client can hold `/stream` at a time; the rest poll in standby and grab the slot first-come-first-served once it frees up
+- Client uses a 60 ms start-playback watermark + 300 ms buffer cap (drops oldest data over the cap to preserve latency); streaming linear resampling handles any sample-rate combination
+- Bandwidth during streaming is ~0.8 Mbps (48 kHz · 16-bit · mono); at rest there is only a /health poll every 250 ms — essentially zero
+- The virtual microphone is provided by the [BlackHole](https://github.com/ExistentialAudio/BlackHole) loopback driver; a custom CoreAudio HAL driver (no BlackHole install needed) is a future direction
 
-## 已知限制 / 后续方向
+## Known limitations / roadmap
 
-- 语音激活阈值目前是固定值(峰值 0.03),嘈杂环境可能误激活,过小声可能不触发;自适应噪声底噪是后续方向
-- 说话触发到客户端出声之间有一次轮询周期(≤250ms)+ 60ms 起播水位的固有延迟,起始 300ms 由服务端回补
-- 未做加密/鉴权,请仅在可信局域网使用
-- 后续可选:Opus 压缩(跨网段/弱网)、mDNS 自动发现服务端、自研 HAL 驱动
+- The VAD threshold is currently fixed (peak 0.03): noisy rooms may trigger it falsely, very quiet speech may not trigger it; adaptive noise-floor tracking is a future direction
+- Inherent latency between speech onset and client playback: one polling cycle (≤250 ms) + the 60 ms start watermark; the first 300 ms is backfilled by the server
+- No encryption/authentication yet — use only on trusted LANs
+- Possible next steps: Opus compression (cross-subnet / weak networks), mDNS auto-discovery of the server, custom HAL driver
