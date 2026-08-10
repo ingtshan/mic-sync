@@ -658,9 +658,10 @@ function hideError(id) {
 // ---------- 状态轮询 ----------
 async function pollStatus() {
   try {
-    if (activeTab === "server") {
-      applyServerStatus(await invoke("server_status"));
-    } else {
+    // 服务端状态无论停在哪个 tab 都要拉:授权确认弹窗是全局的,
+    // 只在 server tab 轮询会让「界面停在客户端页的服务端」永远弹不出确认
+    applyServerStatus(await invoke("server_status"));
+    if (activeTab !== "server") {
       const fs = await invoke("follow_status");
       if (fs.running || followRunning) applyFollowStatus(fs);
       if (!fs.running && clientConnected) {

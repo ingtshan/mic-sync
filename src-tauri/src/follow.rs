@@ -227,7 +227,9 @@ pub fn start(addr: String, output_device: String) -> Result<FollowHandle, String
     }
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
-        phase: AtomicU8::new(Phase::Armed as u8),
+        // 起点就是「预授权中」:跟随线程一启动就去请求 /authorize,
+        // 初始 Armed 会让 UI 第一拍显示「自动待命」,误导用户以为没在请求授权
+        phase: AtomicU8::new(Phase::Authorizing as u8),
         local_in_use: AtomicBool::new(false),
         client: Mutex::new(None),
         error: Mutex::new(None),

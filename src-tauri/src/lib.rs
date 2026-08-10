@@ -573,17 +573,25 @@ fn set_tray_attention(app: &tauri::AppHandle, pending: Option<String>) {
     });
 }
 
-/// 系统通知:只在主窗不可见(常驻托盘)时发——窗口在前台时弹窗本身就是提醒。
+/// 系统通知:主窗聚焦时弹窗本身就是提醒,不发;其余情况都发——
+/// 彻底隐藏(常驻托盘)自不必说,「可见但未聚焦」同样看不见弹窗:窗口被全屏
+/// 会议挡住、在别的桌面/屏幕上,且 macOS 会节流被遮挡 WebView 的定时器,
+/// 弹窗根本刷不出来。之前只判 is_visible 漏掉了这一大类,用户毫无感知。
 /// 通知权限第一次真正要用时才申请,不在启动时骚扰;被拒绝就靠托盘徽标兜底
 #[cfg(desktop)]
 fn notify_pending(app: &tauri::AppHandle, name: &str, kind: &str) {
     use tauri::Manager as _;
     use tauri_plugin_notification::{NotificationExt, PermissionState};
-    let visible = app
-        .get_webview_window("main")
+    let win = app.get_webview_window("main");
+    let visible = win
+        .as_ref()
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);
-    if visible {
+    let focused = win
+        .as_ref()
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or(false);
+    if visible && focused {
         return;
     }
     let n = app.notification();

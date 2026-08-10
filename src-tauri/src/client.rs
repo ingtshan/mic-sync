@@ -542,13 +542,23 @@ fn open_stream(
         // 带上服务端给的原因(如 503 开麦失败、403 对方拒绝)
         let mut body = String::new();
         let _ = stream.read_to_string(&mut body);
-        let msg = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
+        let v = serde_json::from_str::<serde_json::Value>(&body).ok();
+        let kind = v
+            .as_ref()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let msg = v
+            .as_ref()
             .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
             .unwrap_or_else(|| format!("HTTP {code}"));
-        // 403 = 对方拒绝或没在时限内确认。这是人的决定,不是网络故障——
-        // 自动重试只会每隔一秒半再弹一次窗骚扰对方
+        // 403 分两种。明确拒绝是人的决定,不是网络故障——自动重试只会每隔
+        // 一秒半再弹一次窗骚扰对方,必须终态。「超时未确认」却不是决定:
+        // 对方只是不在屏幕前(窗口后台/人离开),本机应用还在用麦克风就该
+        // 继续请求,等对方看到通知点了同意当场接上——按终态处理会让
+        // 「窗口一后台,麦克风就永久哑火」,直到用户手动重开跟随
         return Err(match code {
+            403 if kind == "timeout" => OpenErr::Retry(msg),
             403 => OpenErr::Denied(msg),
             _ => OpenErr::Retry(format!("服务端拒绝串流: {msg}")),
         });
@@ -1119,6 +1129,49 @@ mod tests {
         assert!(stop.load(Ordering::SeqCst), "认领线程应已自行收手");
         let err = shared.error.lock().unwrap().clone().unwrap_or_default();
         assert!(err.contains("拒绝"), "应把对方给的原因带给用户: {err}");
+    }
+
+    /// 「超时未确认」不是人拒绝,只是对方不在屏幕前(窗口后台/人离开):
+    /// 应继续重试,等对方看到通知点了同意当场接上。按终态处理的话,
+    /// 服务端窗口一后台,自动跟随的麦克风就永久哑火——问题的回归测试
+    #[test]
+    fn consent_timeout_is_retried_not_terminal() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        {
+            let hits = hits.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut s) = stream else { continue };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = read_req(&mut s);
+                    let body = r#"{"error":"timeout","message":"对方未在时限内确认,请求已取消"}"#;
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+
+        let shared = test_shared(48000);
+        let stop = spawn_claimer_as(addr, &shared, "unknown-server");
+        // RETRY_OFFLINE_MS(1.5s)内必然打出第二次请求
+        thread::sleep(Duration::from_millis(2500));
+
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "超时未确认应继续重试,hits={}",
+            hits.load(Ordering::SeqCst)
+        );
+        assert_ne!(mode_of(&shared), Mode::Denied, "超时不该进入拒绝终态");
+        assert!(!stop.load(Ordering::SeqCst), "超时未确认不该自行收手");
+        stop.store(true, Ordering::SeqCst);
     }
 
     /// 预授权「始终允许」:随响应签发的令牌要存到对方名下,之后免确认
