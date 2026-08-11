@@ -2,6 +2,28 @@ const { invoke } = window.__TAURI__.core;
 
 const $ = (id) => document.getElementById(id);
 
+// ---------- 增量 DOM 写入 ----------
+// 状态轮询每 100~300ms 跑一轮,大多数时候值根本没变;写入前先比对,
+// 值不变就不碰 DOM——否则常驻后台的窗口会永远在触发样式重算与重绘
+const setText = (el, s) => {
+  if (el.__lastText !== s) {
+    el.__lastText = s;
+    el.textContent = s;
+  }
+};
+const setClass = (el, s) => {
+  if (el.__lastClass !== s) {
+    el.__lastClass = s;
+    el.className = s;
+  }
+};
+const setWidth = (el, s) => {
+  if (el.__lastWidth !== s) {
+    el.__lastWidth = s;
+    el.style.width = s;
+  }
+};
+
 // 当前平台("macos" / "windows" / "ios" …);init 里从后端取,取不到按 macOS 处理
 let OS = "macos";
 // 是否移动端(iOS/Android):纯服务端形态,走大按钮 + 实时音波的专属布局
@@ -56,6 +78,11 @@ async function refreshDevices() {
 }
 
 function fillSelect(select, names, preferFn) {
+  // 设备列表每 3 秒轮询一次,没变就不重建 <option>——既省 DOM churn,
+  // 也避免把用户正展开的下拉框轰掉
+  const sig = names.join("\u0000");
+  if (select.__lastSig === sig) return;
+  select.__lastSig = sig;
   const prev = select.value;
   select.innerHTML = "";
   let preferred = -1;
@@ -117,20 +144,23 @@ function applyServerStatus(s) {
   applyPending(s.pending);
   if (MOBILE) applyMobileStatus(s);
   const btn = $("btn-server-toggle");
-  btn.textContent = serverRunning ? "⏸ 暂停服务" : "▶ 恢复服务";
+  setText(btn, serverRunning ? "⏸ 暂停服务" : "▶ 恢复服务");
   btn.classList.toggle("running", serverRunning);
   $("server-info").classList.toggle("hidden", !serverRunning);
   $("server-port").disabled = serverRunning;
   if (serverRunning) {
-    $("server-summary").textContent = `服务运行中 · 端口 ${s.port}`;
+    setText($("server-summary"), `服务运行中 · 端口 ${s.port}`);
     const streaming = !!s.stream_addr;
-    $("stream-dot").className = "dot " + (streaming ? "green" : "gray");
-    $("server-stream").textContent = streaming
-      ? `🎙 麦克风使用中 → ${s.stream_addr}`
-      : "麦克风空闲 · 未开麦,等待客户端请求";
-    $("server-device").textContent = s.device || "系统默认";
-    $("server-rate").textContent = s.sample_rate ? `${s.sample_rate} Hz` : "—";
-    $("server-level").style.width = `${Math.min(100, s.level * 130)}%`;
+    setClass($("stream-dot"), "dot " + (streaming ? "green" : "gray"));
+    setText(
+      $("server-stream"),
+      streaming
+        ? `🎙 麦克风使用中 → ${s.stream_addr}`
+        : "麦克风空闲 · 未开麦,等待客户端请求"
+    );
+    setText($("server-device"), s.device || "系统默认");
+    setText($("server-rate"), s.sample_rate ? `${s.sample_rate} Hz` : "—");
+    setWidth($("server-level"), `${Math.min(100, s.level * 130)}%`);
     if (s.port !== lastIpsPort) {
       lastIpsPort = s.port;
       showLocalIps(s.port);
@@ -138,7 +168,7 @@ function applyServerStatus(s) {
     if (s.error) showError("server-error", s.error);
   } else {
     lastIpsPort = null;
-    $("server-level").style.width = "0%";
+    setWidth($("server-level"), "0%");
     if (s.error) showError("server-error", s.error);
   }
 }
@@ -176,7 +206,18 @@ let mobileRunning = false;
 
 // 波形数据:后端每块音频(~10ms)上报一个峰值,轮询按 wave_seq 增量对齐;
 // 本地只做平滑滚动,不生造数据——画出来的是真实收音包络
-const wv = { bars: [], total: 0, shown: 0, rate: 60, lastSeq: 0, lastPoll: 0, lastFrame: 0 };
+const wv = {
+  bars: [],
+  total: 0,
+  shown: 0,
+  rate: 60,
+  lastSeq: 0,
+  lastPoll: 0,
+  lastFrame: 0,
+  lastIdle: 0,
+  grad: null,
+  gradH: 0,
+};
 const WV_MAX = 480; // 本地保留的峰值条数上限,够铺满屏幕
 
 function ingestWave(arr, seq) {
@@ -213,13 +254,16 @@ function drawWave(ts) {
     canvas.height = H;
   }
   const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, W, H);
   const midY = H / 2;
   const dt = wv.lastFrame ? Math.min(0.1, (ts - wv.lastFrame) / 1000) : 0;
   wv.lastFrame = ts;
 
   if (!mobileStreaming) {
-    // 空闲基线:待命时轻微呼吸,暂停时暗淡定格
+    // 空闲基线:待命时轻微呼吸,暂停时暗淡定格。
+    // 呼吸动画 ~15fps 就够顺滑,不值得为它常驻 60fps 重绘耗电
+    if (ts - wv.lastIdle < 66) return;
+    wv.lastIdle = ts;
+    ctx.clearRect(0, 0, W, H);
     ctx.globalAlpha = mobileRunning ? 0.22 + 0.12 * Math.sin(ts / 800) : 0.1;
     ctx.fillStyle = "#8b90a0";
     for (let x = 8 * dpr; x < W - 8 * dpr; x += 9 * dpr) {
@@ -231,17 +275,23 @@ function drawWave(ts) {
     return;
   }
 
+  ctx.clearRect(0, 0, W, H);
   // 平滑追赶最新数据:速度与落后量成正比,把轮询到达的抖动吃掉
   wv.shown += (wv.total - wv.shown) * Math.min(1, dt * 6);
 
   const slot = 3.5 * dpr;
   const rightX = W - 12 * dpr;
   const base = wv.total - wv.bars.length; // bars[0] 的绝对序号
-  const grad = ctx.createLinearGradient(0, 0, 0, H);
-  grad.addColorStop(0, "#5b8cff");
-  grad.addColorStop(0.5, "#3ddc84");
-  grad.addColorStop(1, "#5b8cff");
-  ctx.strokeStyle = grad;
+  // 渐变对象随画布高度缓存,不逐帧重建
+  if (!wv.grad || wv.gradH !== H) {
+    wv.gradH = H;
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, "#5b8cff");
+    grad.addColorStop(0.5, "#3ddc84");
+    grad.addColorStop(1, "#5b8cff");
+    wv.grad = grad;
+  }
+  ctx.strokeStyle = wv.grad;
   ctx.lineWidth = 2.2 * dpr;
   ctx.lineCap = "round";
   const maxH = midY - 6 * dpr;
@@ -269,6 +319,8 @@ function applyMobileStatus(s) {
     if (!streaming) resetWave();
   }
   if (streaming) ingestWave(s.wave, s.wave_seq);
+  // 收流时 100ms 轮询喂波形;空闲降到 300ms,省下常驻的 IPC 与重绘
+  setPollInterval(streaming ? 100 : 300);
   const btn = $("btn-mic");
   btn.classList.toggle("live", streaming);
   btn.classList.toggle("armed", mobileRunning && !streaming);
@@ -277,19 +329,21 @@ function applyMobileStatus(s) {
   const sum = $("mobile-summary");
   const sub = $("mobile-sub");
   if (!mobileRunning) {
-    dot.className = "dot gray";
-    sum.textContent = "共享已暂停";
-    sub.textContent = "点上方按钮恢复共享,电脑才能搜到并使用这台手机的麦克风。";
+    setClass(dot, "dot gray");
+    setText(sum, "共享已暂停");
+    setText(sub, "点上方按钮恢复共享,电脑才能搜到并使用这台手机的麦克风。");
     $("mobile-conn").classList.add("hidden");
   } else if (streaming) {
-    dot.className = "dot green";
-    sum.textContent = "麦克风使用中";
-    sub.textContent =
-      `正在收音,实时传给 ${s.stream_addr}` + (s.sample_rate ? ` · ${s.sample_rate} Hz` : "");
+    setClass(dot, "dot green");
+    setText(sum, "麦克风使用中");
+    setText(
+      sub,
+      `正在收音,实时传给 ${s.stream_addr}` + (s.sample_rate ? ` · ${s.sample_rate} Hz` : "")
+    );
   } else {
-    dot.className = "dot blue";
-    sum.textContent = `待命中 · 端口 ${s.port}`;
-    sub.textContent = "现在完全不收音。电脑端一发起使用,这里会自动开麦并跳出实时音波。";
+    setClass(dot, "dot blue");
+    setText(sum, `待命中 · 端口 ${s.port}`);
+    setText(sub, "现在完全不收音。电脑端一发起使用,这里会自动开麦并跳出实时音波。");
   }
 }
 
@@ -306,9 +360,8 @@ function setupMobile() {
   $("mobile-advanced-body").appendChild($("server-controls"));
   $("panel-mobile").appendChild($("server-error"));
   $("btn-mic").addEventListener("click", toggleServer);
-  // 波形要跟上 ~10ms 一块的峰值流,状态轮询提到 100ms
-  clearInterval(pollTimer);
-  pollTimer = setInterval(pollStatus, 100);
+  // 轮询频率由 applyMobileStatus 按需切换:收流 100ms 喂波形,空闲 300ms
+  setPollInterval(300);
   requestAnimationFrame(drawWave);
 }
 
@@ -491,6 +544,13 @@ $("btn-discover").addEventListener("click", discoverServers);
 let clientConnected = false;
 let followRunning = false;
 
+// 缓冲行顺带带出抖动与欠载:一眼看出当前延迟是吸收网络抖动换来的,
+// 还是网络明明很稳却白垫着;欠载>0 说明水位曾不够,声音断过
+const bufferLine = (buf, jitter, underruns) =>
+  `${buf || 0} ms` +
+  (jitter ? ` · 抖动 ${jitter} ms` : "") +
+  (underruns ? ` · 欠载 ${underruns} 次` : "");
+
 // 自动跟随:检测到本机应用使用 BlackHole 时自动认领远端麦克风
 $("btn-follow-toggle").addEventListener("click", async () => {
   const btn = $("btn-follow-toggle");
@@ -558,11 +618,11 @@ function applyFollowStatus(s) {
     ],
   };
   const view = views[s.phase] || ["red", "未知状态"];
-  $("client-dot").className = "dot " + view[0];
-  $("client-summary").textContent = view[1];
-  $("client-buffer").textContent = `${c.buffer_ms || 0} ms`;
-  $("client-rate").textContent = c.sample_rate ? `${c.sample_rate} Hz` : "—";
-  $("client-level").style.width = `${Math.min(100, (c.level || 0) * 130)}%`;
+  setClass($("client-dot"), "dot " + view[0]);
+  setText($("client-summary"), view[1]);
+  setText($("client-buffer"), bufferLine(c.buffer_ms, c.jitter_ms, c.underruns));
+  setText($("client-rate"), c.sample_rate ? `${c.sample_rate} Hz` : "—");
+  setWidth($("client-level"), `${Math.min(100, (c.level || 0) * 130)}%`);
   if (s.error) showError("client-error", s.error);
   else hideError("client-error");
 }
@@ -610,18 +670,18 @@ function applyClientStatus(s) {
         ended: ["red", "本次使用已结束"],
         denied: ["red", "对方未同意本次使用"],
       }[s.mode] || ["red", "未知状态"];
-    $("client-dot").className = "dot " + view[0];
-    $("client-summary").textContent = view[1];
-    $("client-buffer").textContent = `${s.buffer_ms} ms`;
-    $("client-rate").textContent = s.sample_rate ? `${s.sample_rate} Hz` : "—";
-    $("client-level").style.width = `${Math.min(100, s.level * 130)}%`;
+    setClass($("client-dot"), "dot " + view[0]);
+    setText($("client-summary"), view[1]);
+    setText($("client-buffer"), bufferLine(s.buffer_ms, s.jitter_ms, s.underruns));
+    setText($("client-rate"), s.sample_rate ? `${s.sample_rate} Hz` : "—");
+    setWidth($("client-level"), `${Math.min(100, s.level * 130)}%`);
     if (s.error) showError("client-error", s.error);
     else hideError("client-error");
   } else {
-    $("client-level").style.width = "0%";
+    setWidth($("client-level"), "0%");
     if (s.error) {
-      $("client-dot").className = "dot red";
-      $("client-summary").textContent = "已停止";
+      setClass($("client-dot"), "dot red");
+      setText($("client-summary"), "已停止");
       showError("client-error", s.error);
     }
   }
@@ -647,7 +707,7 @@ $("btn-copy-brew").addEventListener("click", () => {
 // ---------- 错误提示 ----------
 function showError(id, msg) {
   const el = $(id);
-  el.textContent = typeof msg === "string" ? msg : JSON.stringify(msg);
+  setText(el, typeof msg === "string" ? msg : JSON.stringify(msg));
   el.classList.remove("hidden");
 }
 
@@ -659,8 +719,9 @@ function hideError(id) {
 async function pollStatus() {
   try {
     // 服务端状态无论停在哪个 tab 都要拉:授权确认弹窗是全局的,
-    // 只在 server tab 轮询会让「界面停在客户端页的服务端」永远弹不出确认
-    applyServerStatus(await invoke("server_status"));
+    // 只在 server tab 轮询会让「界面停在客户端页的服务端」永远弹不出确认。
+    // 波形序列只有移动端画,桌面端不必每轮拷贝+序列化 150 个峰值
+    applyServerStatus(await invoke("server_status", { wave: MOBILE }));
     if (activeTab !== "server") {
       const fs = await invoke("follow_status");
       if (fs.running || followRunning) applyFollowStatus(fs);
@@ -672,7 +733,16 @@ async function pollStatus() {
     /* 轮询失败静默 */
   }
 }
-let pollTimer = setInterval(pollStatus, 200);
+let pollMs = 200;
+let pollTimer = setInterval(pollStatus, pollMs);
+
+// 轮询频率随场景切换(移动端收流 100ms / 空闲 300ms;桌面恒 200ms)
+function setPollInterval(ms) {
+  if (pollMs === ms) return;
+  pollMs = ms;
+  clearInterval(pollTimer);
+  pollTimer = setInterval(pollStatus, ms);
+}
 
 // ---------- 启动 ----------
 (async function init() {
@@ -717,7 +787,7 @@ let pollTimer = setInterval(pollStatus, 200);
   }
   // 同步一次服务端状态(是否已在监听由上次退出时的形态决定)
   try {
-    applyServerStatus(await invoke("server_status"));
+    applyServerStatus(await invoke("server_status", { wave: MOBILE }));
   } catch (e) {
     /* 忽略 */
   }

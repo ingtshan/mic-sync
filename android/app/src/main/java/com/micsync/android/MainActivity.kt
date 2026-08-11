@@ -73,8 +73,10 @@ class MainActivity : Activity() {
         connCard = findViewById(R.id.conn_card)
         ipText = findViewById(R.id.ip_text)
 
-        // 波形直接从服务进程内的峰值历史取数,画的是真实收音包络
+        // 波形直接从服务进程内的峰值历史取数,画的是真实收音包络;
+        // 先查序号,有新块才取整份快照,免得 60fps 白拷贝数组
         waveform.source = { MicServerService.instance?.server?.waveSnapshot() }
+        waveform.seqSource = { MicServerService.instance?.server?.waveSeq() }
 
         btnMic.setOnClickListener {
             if (MicServerService.instance != null) {
@@ -149,15 +151,15 @@ class MainActivity : Activity() {
         // 大按钮三态 + 使用中的扩散圆环
         when {
             server == null -> {
-                btnMic.setBackgroundResource(R.drawable.bg_mic_paused)
+                setMicBg(R.drawable.bg_mic_paused)
                 stopPulse()
             }
             streaming -> {
-                btnMic.setBackgroundResource(R.drawable.bg_mic_live)
+                setMicBg(R.drawable.bg_mic_live)
                 startPulse()
             }
             else -> {
-                btnMic.setBackgroundResource(R.drawable.bg_mic_armed)
+                setMicBg(R.drawable.bg_mic_armed)
                 stopPulse()
             }
         }
@@ -166,24 +168,29 @@ class MainActivity : Activity() {
         when {
             server == null -> {
                 setDot(R.color.text_dim)
-                statusText.text = getString(R.string.status_paused)
-                subText.text = service?.fatalError ?: getString(R.string.sub_paused)
+                setTextIfChanged(statusText, getString(R.string.status_paused))
+                setTextIfChanged(subText, service?.fatalError ?: getString(R.string.sub_paused))
                 connCard.visibility = View.GONE
             }
             streaming -> {
                 setDot(R.color.green)
-                statusText.text = getString(R.string.status_live)
+                setTextIfChanged(statusText, getString(R.string.status_live))
                 val rate = server.lastRate.get()
-                subText.text = getString(R.string.sub_live, streamAddr) +
-                    if (rate > 0) " · $rate Hz" else ""
+                setTextIfChanged(
+                    subText,
+                    getString(R.string.sub_live, streamAddr) + if (rate > 0) " · $rate Hz" else ""
+                )
                 connCard.visibility = View.VISIBLE
                 updateIps(server.port)
             }
             else -> {
                 setDot(R.color.accent)
-                statusText.text = getString(R.string.status_armed, server.port)
-                subText.text = server.lastError.get()?.let { getString(R.string.status_error, it) }
-                    ?: getString(R.string.sub_armed)
+                setTextIfChanged(statusText, getString(R.string.status_armed, server.port))
+                setTextIfChanged(
+                    subText,
+                    server.lastError.get()?.let { getString(R.string.status_error, it) }
+                        ?: getString(R.string.sub_armed)
+                )
                 connCard.visibility = View.VISIBLE
                 updateIps(server.port)
             }
@@ -201,13 +208,40 @@ class MainActivity : Activity() {
         }
     }
 
+    // UI 每 300ms 轮询刷新,以下写入都先比对——值没变就不碰视图,
+    // 避免常驻的 invalidate/重排与 Drawable/ColorStateList 反复创建
+
+    private var dotColorRes = 0
     private fun setDot(colorRes: Int) {
+        if (dotColorRes == colorRes) return
+        dotColorRes = colorRes
         statusDot.backgroundTintList = ColorStateList.valueOf(getColor(colorRes))
     }
 
+    private var micBgRes = 0
+    private fun setMicBg(res: Int) {
+        if (micBgRes == res) return
+        micBgRes = res
+        btnMic.setBackgroundResource(res)
+    }
+
+    private fun setTextIfChanged(v: TextView, s: CharSequence) {
+        if (v.text.toString() != s.toString()) v.text = s
+    }
+
+    private var ipsCachedAt = 0L
+    private var ipsCachedPort = -1
+
     private fun updateIps(port: Int) {
+        // 网卡枚举是 JNI + 系统调用,UI 每 300ms 轮询一次没必要跟着枚举;
+        // 地址几乎不变,3 秒刷一次足够(换网络最多迟 3 秒显示)
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (port == ipsCachedPort && now - ipsCachedAt < 3000) return
+        ipsCachedAt = now
+        ipsCachedPort = port
         val text = lanAddresses().joinToString("\n") { "$it:$port" }
-        ipText.text = text.ifEmpty { getString(R.string.no_network) }
+        val shown = text.ifEmpty { getString(R.string.no_network) }
+        if (ipText.text != shown) ipText.text = shown
     }
 
     private fun showConsent(server: MicServer, req: PendingRequest) {

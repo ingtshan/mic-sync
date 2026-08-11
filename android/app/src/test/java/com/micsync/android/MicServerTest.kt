@@ -193,6 +193,67 @@ class MicServerTest {
         server.close()
     }
 
+    /** 线格式锁定:与桌面版 audio.rs 的 adpcm_known_vector_locks_wire_format
+     *  用同一输入、期望同一串字节——任何一端改了状态机都会在两边同时翻车 */
+    @Test
+    fun adpcmKnownVectorMatchesDesktop() {
+        val samples = shortArrayOf(0, 1000, 3000, 6000, 10000, 6000, 0, -6000, -10000, -3000)
+        val enc = ImaAdpcmEncoder()
+        val buf = java.nio.ByteBuffer.allocate(5)
+        enc.encodeInto(samples, buf)
+        assertEquals(5, buf.position())
+        val expected = byteArrayOf(0x70, 0x77, 0x77, 0xFE.toByte(), 0x0F)
+        assertTrue(
+            "编码字节应与桌面版一致: ${buf.array().joinToString()}",
+            buf.array().contentEquals(expected)
+        )
+    }
+
+    /** 客户端声明支持 ADPCM → 流头回告 codec=1,帧载荷压到每样本半字节 */
+    @Test
+    fun streamNegotiatesAdpcm() {
+        val server = MicServer(0, fakeCapture)
+        val s = Socket("127.0.0.1", server.port)
+        s.soTimeout = 5000
+        s.getOutputStream().write(
+            ("GET /stream HTTP/1.1\r\nHost: t\r\nX-MicSync-Codec: adpcm\r\n" +
+                "Connection: close\r\n\r\n").toByteArray()
+        )
+        val input = s.getInputStream()
+        assertTrue(readHead(input).startsWith("HTTP/1.1 200"))
+        val magic = readExact(input, 12)
+        assertEquals(
+            "流头应回告 ADPCM",
+            MicServer.CODEC_ADPCM,
+            (magic[10].toInt() and 0xFF) or ((magic[11].toInt() and 0xFF) shl 8)
+        )
+        // 一帧 441 样本 → 221 字节载荷;若载荷不是 4:1,下一个帧头读到的就是错位垃圾
+        val n = leInt(readExact(input, 4), 0)
+        assertEquals(441, n)
+        readExact(input, (n + 1) / 2)
+        assertEquals("载荷长度必须是每样本半字节", 441, leInt(readExact(input, 4), 0))
+        s.close()
+        server.close()
+    }
+
+    /** 不带 X-MicSync-Codec 的旧客户端照旧收 PCM,流头 codec 位为 0 */
+    @Test
+    fun streamWithoutCodecHeaderStaysPcm() {
+        val server = MicServer(0, fakeCapture)
+        val c = httpGet(server.port, "/stream")
+        val input = c.getInputStream()
+        assertTrue(readHead(input).startsWith("HTTP/1.1 200"))
+        val magic = readExact(input, 12)
+        assertEquals(
+            "旧客户端必须回落 PCM",
+            MicServer.CODEC_PCM16,
+            (magic[10].toInt() and 0xFF) or ((magic[11].toInt() and 0xFF) shl 8)
+        )
+        assertEquals(441, readFrame(input).audio!!.size)
+        c.close()
+        server.close()
+    }
+
     /** 服务停止:在场客户端收到 END_SERVER_CLOSING 结束帧 */
     @Test
     fun serverStopNotifiesClient() {

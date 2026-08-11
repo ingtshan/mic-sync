@@ -70,6 +70,11 @@ class MicServer(
         const val END_SERVER_CLOSING = 0
         const val END_PREEMPTED = 1
 
+        /** 帧内音频编码,写在流头原「保留」u16 里(语义同桌面版 server.rs 的 Codec):
+         *  客户端在 X-MicSync-Codec 请求头声明支持才启用 ADPCM,否则回落 PCM */
+        const val CODEC_PCM16 = 0
+        const val CODEC_ADPCM = 1
+
         /** 波形历史容量:20ms 一块,150 块约 3 秒 */
         private const val WAVE_CAP = 150
     }
@@ -116,6 +121,9 @@ class MicServer(
     fun waveSnapshot(): Pair<FloatArray, Long> = synchronized(waveLock) {
         Pair(FloatArray(wave.size) { i -> wave[i] / 1000f }, waveSeq)
     }
+
+    /** 波形累计块计数。UI 每帧先查它,没有新数据就不取快照(免 60fps 的数组拷贝) */
+    fun waveSeq(): Long = synchronized(waveLock) { waveSeq }
 
     private fun pushWave(permille: Int) = synchronized(waveLock) {
         if (wave.size >= WAVE_CAP) wave.removeFirst()
@@ -192,6 +200,13 @@ class MicServer(
 
     private fun handleStream(sock: Socket, head: String, output: OutputStream) {
         val addr = sock.remoteSocketAddress?.toString()?.removePrefix("/") ?: "?"
+
+        // 编码协商:对方声明支持 ADPCM 才用(4:1 带宽);否则回落 PCM
+        val codec = if (headerValue(head, "x-micsync-codec").contains("adpcm")) {
+            CODEC_ADPCM
+        } else {
+            CODEC_PCM16
+        }
 
         // 授权闸门:先确认对方有权使用本机麦克风,再谈认领会话与开麦(语义同桌面版)。
         // 令牌是服务端签发的私密凭据,名字只是展示用的不可信输入
@@ -273,18 +288,19 @@ class MicServer(
                 ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n" +
                     "Cache-Control: no-store\r\n" + tokenHeader + "Connection: close\r\n\r\n").toByteArray()
             )
-            // 二进制流头: MAGIC(4) + sample_rate u32 LE + channels u16 LE + reserved u16
+            // 二进制流头: MAGIC(4) + sample_rate u32 LE + channels u16 LE + codec u16 LE
+            // (codec 位原为保留字段恒 0,旧客户端忽略它 = 恰好按 PCM 解读)
             val header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
             header.put(MAGIC)
             header.putInt(handle.sampleRate)
             header.putShort(1)
-            header.putShort(0)
+            header.putShort(codec.toShort())
             output.write(header.array())
             output.flush()
         }.isSuccess
 
         if (handshakeOk) {
-            writeFrames(output, queue, myEnd)
+            writeFrames(output, queue, myEnd, codec)
         }
 
         // 会话收尾:关麦克风、清电平/波形、释放会话(可能已被新会话顶替)
@@ -328,12 +344,17 @@ class MicServer(
         }
     }
 
-    /** 帧写循环。退出场景:服务停止/被抢占(发 0 长度结束帧告知原因)、客户端断开(写失败) */
+    /** 帧写循环。退出场景:服务停止/被抢占(发 0 长度结束帧告知原因)、客户端断开(写失败)。
+     *  编码在这条网络线程做,不占采集回调;ADPCM 状态跨帧延续,随会话建立/销毁 */
     private fun writeFrames(
         output: OutputStream,
         queue: ArrayBlockingQueue<ShortArray>,
         end: AtomicBoolean,
+        codec: Int,
     ) {
+        // 编码缓冲跨帧复用(帧长固定 20ms,50 帧/秒逐帧分配纯属 GC 压力)
+        var buf = ByteBuffer.allocate(0).order(ByteOrder.LITTLE_ENDIAN)
+        val encoder = if (codec == CODEC_ADPCM) ImaAdpcmEncoder() else null
         while (true) {
             if (stopFlag.get()) {
                 sendEnd(output, END_SERVER_CLOSING)
@@ -344,12 +365,20 @@ class MicServer(
                 return
             }
             val frame = queue.poll(100, TimeUnit.MILLISECONDS) ?: continue
-            // 帧: 样本数 u32 LE + i16 LE 样本
-            val buf = ByteBuffer.allocate(4 + frame.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+            // 帧: 样本数 u32 LE + 载荷(PCM:每样本 2 字节;ADPCM:每样本半字节)
+            val need = 4 + if (encoder != null) (frame.size + 1) / 2 else frame.size * 2
+            if (buf.capacity() < need) {
+                buf = ByteBuffer.allocate(need).order(ByteOrder.LITTLE_ENDIAN)
+            }
+            buf.clear()
             buf.putInt(frame.size)
-            for (s in frame) buf.putShort(s)
+            if (encoder != null) {
+                encoder.encodeInto(frame, buf)
+            } else {
+                for (s in frame) buf.putShort(s)
+            }
             try {
-                output.write(buf.array())
+                output.write(buf.array(), 0, buf.position())
             } catch (_: Exception) {
                 return
             }
@@ -389,9 +418,11 @@ class MicServer(
 
     /** 读 HTTP 请求头(到空行为止,上限 8KB);失败或超时返回 null */
     private fun readHead(input: InputStream): String? {
-        val buf = ArrayList<Byte>(256)
+        // ByteArrayOutputStream 存原始字节,不像 ArrayList<Byte> 那样逐字节装箱
+        val buf = java.io.ByteArrayOutputStream(256)
+        var matched = 0 // 已连续匹配 \r\n\r\n 的前缀长度
         while (true) {
-            if (buf.size >= 8192) return null
+            if (buf.size() >= 8192) return null
             val b = try {
                 input.read()
             } catch (_: SocketTimeoutException) {
@@ -400,12 +431,14 @@ class MicServer(
                 return null
             }
             if (b < 0) return null
-            buf.add(b.toByte())
-            val n = buf.size
-            if (n >= 4 &&
-                buf[n - 4] == '\r'.code.toByte() && buf[n - 3] == '\n'.code.toByte() &&
-                buf[n - 2] == '\r'.code.toByte() && buf[n - 1] == '\n'.code.toByte()
-            ) break
+            buf.write(b)
+            matched = when {
+                b == '\r'.code && (matched == 0 || matched == 2) -> matched + 1
+                b == '\n'.code && (matched == 1 || matched == 3) -> matched + 1
+                b == '\r'.code -> 1
+                else -> 0
+            }
+            if (matched == 4) break
         }
         return runCatching { String(buf.toByteArray(), Charsets.UTF_8) }.getOrNull()
     }

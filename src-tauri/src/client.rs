@@ -10,13 +10,16 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, StreamTrait};
 
 use crate::audio;
-use crate::server::{END_PREEMPTED, MAGIC};
+use crate::server::{Codec, END_PREEMPTED, MAGIC};
 use crate::settings;
 
 /// 收流缓冲上限(毫秒)——超过则丢最老的数据,防止延迟无限增长
 const MAX_BUFFER_MS: usize = 300;
-/// 起播水位(毫秒)——攒够这些数据才开始出声,吸收网络抖动
+/// 起播水位的初始值(毫秒)。串流建立后由抖动估计动态调整:
+/// 平稳网络会降到 PREBUFFER_FLOOR_MS 附近换更低延迟,抖动大或出现欠载则抬高
 const PREBUFFER_MS: usize = 60;
+/// 动态水位的初始下限(毫秒);每次欠载 +20,封顶 200
+const PREBUFFER_FLOOR_MS: u32 = 40;
 /// 连接中断后的重连间隔(毫秒)
 const RETRY_LOST_MS: u64 = 800;
 /// 服务端不可达时的重试间隔(毫秒)
@@ -92,6 +95,12 @@ struct Shared {
     buffer: Mutex<VecDeque<f32>>,
     /// 起播状态:false 时静音蓄水
     started: AtomicBool,
+    /// 起播水位(输出采样数):收流线程按到达抖动动态调,播放回调实时读
+    prebuffer: AtomicU32,
+    /// 播放欠载累计次数(蓄水后又放空)——缓冲深度不够的直接证据,UI 可见
+    underruns: AtomicU32,
+    /// 最近估计的帧到达抖动(毫秒,展示用)
+    jitter_ms: AtomicU32,
     /// 本轮以「被其他设备接管」结束(区别于服务端主动停止)
     preempted: AtomicBool,
     error: Mutex<Option<String>>,
@@ -129,6 +138,16 @@ impl ClientHandle {
 
     pub fn level(&self) -> f32 {
         audio::decode_level(self.shared.level.load(Ordering::Relaxed))
+    }
+
+    /// 帧到达抖动估计(毫秒);0 = 网络平稳或尚未测得
+    pub fn jitter_ms(&self) -> u32 {
+        self.shared.jitter_ms.load(Ordering::Relaxed)
+    }
+
+    /// 本轮播放欠载(声音断了一下)的累计次数
+    pub fn underruns(&self) -> u32 {
+        self.shared.underruns.load(Ordering::Relaxed)
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -186,6 +205,9 @@ pub fn connect(addr: String, output_device: Option<String>) -> Result<ClientHand
         level: AtomicU32::new(0),
         buffer: Mutex::new(VecDeque::new()),
         started: AtomicBool::new(false),
+        prebuffer: AtomicU32::new(0),
+        underruns: AtomicU32::new(0),
+        jitter_ms: AtomicU32::new(0),
         preempted: AtomicBool::new(false),
         error: Mutex::new(None),
     });
@@ -243,7 +265,7 @@ fn claim_thread(
             *shared.error.lock().unwrap() = Some(format!("等待「{}」确认授权…", server.name));
         }
         match open_stream(&sock_addr, &host, &token) {
-            Ok((stream, src_rate, new_token)) => {
+            Ok((stream, src_rate, codec, new_token)) => {
                 // 对方选了「始终允许」:记下令牌,以后不再打扰他
                 if let Some(t) = new_token {
                     settings::remember_server(&server.id, &t, &server.name);
@@ -251,7 +273,7 @@ fn claim_thread(
                 shared.src_rate.store(src_rate, Ordering::Relaxed);
                 *shared.error.lock().unwrap() = None;
                 shared.mode.store(Mode::Streaming as u8, Ordering::Relaxed);
-                match run_stream(stream, &stop, &shared) {
+                match run_stream(stream, codec, &stop, &shared) {
                     StreamEnd::Graceful(reason) => {
                         // 服务端明确结束:不自动重连,等用户重新发起
                         let msg = if reason == END_PREEMPTED {
@@ -482,12 +504,13 @@ fn split_http_response(resp: &str) -> Result<(u16, &str), String> {
 
 /// GET /stream:请求使用麦克风(服务端据此按需开麦,新请求接管旧串流)。
 /// 带上本机设备名与令牌:未授权时服务端会挂起请求等对方确认,故读超时要盖过确认时限。
-/// 返回 (流, 采样率, 服务端新签发的令牌)
+/// 同时声明支持 ADPCM,新服务端会用 4:1 压缩,旧服务端忽略照发 PCM。
+/// 返回 (流, 采样率, 编码方式, 服务端新签发的令牌)
 fn open_stream(
     sock_addr: &SocketAddr,
     host: &str,
     token: &str,
-) -> Result<(TcpStream, u32, Option<String>), OpenErr> {
+) -> Result<(TcpStream, u32, Codec, Option<String>), OpenErr> {
     let mut stream = TcpStream::connect_timeout(sock_addr, Duration::from_secs(2))
         .map_err(|e| OpenErr::Retry(format!("连接失败: {e}")))?;
     let _ = stream.set_nodelay(true);
@@ -507,7 +530,7 @@ fn open_stream(
     stream
         .write_all(
             format!(
-                "GET /stream HTTP/1.1\r\nHost: {host}\r\nX-MicSync-Name: {name}\r\n{token_header}Connection: close\r\n\r\n"
+                "GET /stream HTTP/1.1\r\nHost: {host}\r\nX-MicSync-Name: {name}\r\nX-MicSync-Codec: adpcm\r\n{token_header}Connection: close\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -581,11 +604,45 @@ fn open_stream(
     if !(8000..=192_000).contains(&src_rate) {
         return Err(OpenErr::Retry(format!("服务端采样率异常: {src_rate}")));
     }
-    Ok((stream, src_rate, new_token))
+    // 原「保留」位:旧服务端恒写 0(=PCM),新服务端回告协商结果
+    let codec_wire = u16::from_le_bytes([header[10], header[11]]);
+    let codec = Codec::from_wire(codec_wire)
+        .ok_or_else(|| OpenErr::Retry(format!("服务端使用了未知编码: {codec_wire}")))?;
+    Ok((stream, src_rate, codec, new_token))
 }
 
-/// 一轮串流会话:读帧 → 重采样 → 进抖动缓冲,直到会话结束
-fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) -> StreamEnd {
+/// read_full 的结果:读满 / 用户停止 / 连接中断
+enum ReadEnd {
+    Done,
+    Stopped,
+    Lost,
+}
+
+/// 读满整个缓冲。套接字带短读超时,超时窗口里检查停止标志后继续;
+/// 已读入的部分绝不丢弃——半截数据一丢,后续帧边界全部错位
+fn read_full(stream: &mut TcpStream, buf: &mut [u8], stop: &AtomicBool) -> ReadEnd {
+    let mut off = 0;
+    while off < buf.len() {
+        if stop.load(Ordering::SeqCst) {
+            return ReadEnd::Stopped;
+        }
+        match stream.read(&mut buf[off..]) {
+            Ok(0) => return ReadEnd::Lost,
+            Ok(n) => off += n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return ReadEnd::Lost,
+        }
+    }
+    ReadEnd::Done
+}
+
+/// 一轮串流会话:读帧 → 解码 → 重采样 → 进抖动缓冲,直到会话结束。
+/// 帧循环里所有缓冲(字节/单声道/重采样)跨帧复用,稳态零分配。
+/// 同时估计帧到达抖动,动态调整起播水位:网络稳就压低延迟,
+/// 抖动大或出现欠载就抬高水位,少爆音
+fn run_stream(mut stream: TcpStream, codec: Codec, stop: &AtomicBool, shared: &Shared) -> StreamEnd {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
 
     // 等待播放线程就绪,拿到输出采样率后才能建重采样器
@@ -600,35 +657,35 @@ fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) -> Stre
         thread::sleep(Duration::from_millis(10));
     };
     let src_rate = shared.src_rate.load(Ordering::Relaxed);
-    let mut resampler = audio::LinearResampler::new(src_rate, out_rate);
+    let mut resampler = audio::StreamResampler::new(src_rate, out_rate);
     let max_buffer = out_rate as usize * MAX_BUFFER_MS / 1000;
+
+    let mut decoder = audio::ImaAdpcm::new();
+    let mut est = audio::JitterEstimator::new();
+    let mut floor_ms = PREBUFFER_FLOOR_MS;
+    let mut last_arrival: Option<std::time::Instant> = None;
+    let mut seen_underruns = shared.underruns.load(Ordering::Relaxed);
+    let mut frames: u32 = 0;
 
     let mut len_buf = [0u8; 4];
     let mut byte_buf: Vec<u8> = Vec::new();
+    let mut mono: Vec<f32> = Vec::new();
     let mut resampled: Vec<f32> = Vec::new();
 
     loop {
-        if stop.load(Ordering::SeqCst) {
-            return StreamEnd::Stopped;
-        }
         // 读帧头(样本数)
-        match stream.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue
-            }
-            Err(_) => return StreamEnd::Lost,
+        match read_full(&mut stream, &mut len_buf, stop) {
+            ReadEnd::Done => {}
+            ReadEnd::Stopped => return StreamEnd::Stopped,
+            ReadEnd::Lost => return StreamEnd::Lost,
         }
         let n_samples = u32::from_le_bytes(len_buf) as usize;
         if n_samples == 0 {
             // 优雅结束帧:后随 u32 原因码(被接管 / 服务端停止)
             let mut reason = [0u8; 4];
-            let reason = match stream.read_exact(&mut reason) {
-                Ok(()) => u32::from_le_bytes(reason),
-                Err(_) => crate::server::END_SERVER_CLOSING,
+            let reason = match read_full(&mut stream, &mut reason, stop) {
+                ReadEnd::Done => u32::from_le_bytes(reason),
+                _ => crate::server::END_SERVER_CLOSING,
             };
             return StreamEnd::Graceful(reason);
         }
@@ -636,16 +693,48 @@ fn run_stream(mut stream: TcpStream, stop: &AtomicBool, shared: &Shared) -> Stre
             *shared.error.lock().unwrap() = Some("收到异常数据帧,本轮串流已断开".into());
             return StreamEnd::Lost;
         }
-        byte_buf.resize(n_samples * 2, 0);
-        if stream.read_exact(&mut byte_buf).is_err() {
-            return StreamEnd::Lost;
+        byte_buf.resize(codec.payload_len(n_samples), 0);
+        match read_full(&mut stream, &mut byte_buf, stop) {
+            ReadEnd::Done => {}
+            ReadEnd::Stopped => return StreamEnd::Stopped,
+            ReadEnd::Lost => return StreamEnd::Lost,
         }
 
-        let samples: Vec<i16> = byte_buf
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]))
-            .collect();
-        let mono = audio::i16_to_f32(&samples);
+        // 抖动估计与水位调整:每帧观测到达间隔,欠载立即抬高下限,
+        // 其余每 16 帧(~150ms)把目标水位与抖动读数同步给播放端/UI
+        let now = std::time::Instant::now();
+        if let Some(prev) = last_arrival {
+            let delta_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
+            est.observe(delta_ms, n_samples as f64 * 1000.0 / src_rate as f64);
+        }
+        last_arrival = Some(now);
+        frames = frames.wrapping_add(1);
+        let underruns_now = shared.underruns.load(Ordering::Relaxed);
+        let underran = underruns_now != seen_underruns;
+        if underran {
+            seen_underruns = underruns_now;
+            floor_ms = (floor_ms + 20).min(200);
+        }
+        if underran || frames.is_multiple_of(16) {
+            let target_ms = est.target_prebuffer_ms(floor_ms);
+            shared
+                .prebuffer
+                .store(target_ms * out_rate / 1000, Ordering::Relaxed);
+            shared
+                .jitter_ms
+                .store(est.jitter_ms().round() as u32, Ordering::Relaxed);
+        }
+
+        // 载荷 → f32 单声道,直接写入复用缓冲(不经过中间 Vec<i16>)
+        mono.clear();
+        match codec {
+            Codec::Pcm16 => mono.extend(
+                byte_buf
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / i16::MAX as f32),
+            ),
+            Codec::Adpcm => decoder.decode_into_f32(&byte_buf, n_samples, &mut mono),
+        }
 
         resampled.clear();
         resampler.process(&mono, &mut resampled);
@@ -685,25 +774,33 @@ fn playback_thread(
     let sample_format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.into();
 
-    let prebuffer = out_rate as usize * PREBUFFER_MS / 1000;
+    // 起播水位先按固定默认值蓄水;串流建立后由收流线程按实测抖动动态调整
+    shared.prebuffer.store(
+        (out_rate as usize * PREBUFFER_MS / 1000) as u32,
+        Ordering::Relaxed,
+    );
 
-    // 出声回调:从抖动缓冲取单声道数据,复制到所有声道
+    // 出声回调:从抖动缓冲取单声道数据,复制到所有声道。
+    // started 镜像到局部变量,循环体内不做原子操作(每秒几万个采样点)
     let fill = {
         let shared = shared.clone();
         move |out_frames: usize, write: &mut dyn FnMut(usize, f32)| {
             let mut buf = shared.buffer.lock().unwrap();
-            let started = shared.started.load(Ordering::Relaxed);
+            let prebuffer = shared.prebuffer.load(Ordering::Relaxed) as usize;
+            let before = shared.started.load(Ordering::Relaxed);
+            let mut started = before;
             if !started && buf.len() >= prebuffer {
-                shared.started.store(true, Ordering::Relaxed);
+                started = true;
             }
             let mut peak = 0.0f32;
             for i in 0..out_frames {
-                let s = if shared.started.load(Ordering::Relaxed) {
+                let s = if started {
                     match buf.pop_front() {
                         Some(s) => s,
                         None => {
-                            // 欠载:回到蓄水状态
-                            shared.started.store(false, Ordering::Relaxed);
+                            // 欠载:回到蓄水状态,记一笔给收流线程抬水位/给 UI 展示
+                            started = false;
+                            shared.underruns.fetch_add(1, Ordering::Relaxed);
                             0.0
                         }
                     }
@@ -712,6 +809,9 @@ fn playback_thread(
                 };
                 peak = peak.max(s.abs());
                 write(i, s);
+            }
+            if started != before {
+                shared.started.store(started, Ordering::Relaxed);
             }
             shared
                 .level
@@ -822,6 +922,9 @@ mod tests {
             level: AtomicU32::new(0),
             buffer: Mutex::new(VecDeque::new()),
             started: AtomicBool::new(false),
+            prebuffer: AtomicU32::new(0),
+            underruns: AtomicU32::new(0),
+            jitter_ms: AtomicU32::new(0),
             preempted: AtomicBool::new(false),
             error: Mutex::new(None),
         })
@@ -1029,6 +1132,97 @@ mod tests {
             !shared.preempted.load(Ordering::Relaxed),
             "server close is not a preemption"
         );
+    }
+
+    /// 服务端回告 ADPCM:客户端按 4:1 载荷读帧、解码进抖动缓冲,
+    /// 且动态水位开始工作(prebuffer 被收流线程设置)
+    #[test]
+    fn claimer_decodes_adpcm_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let saw_codec_header = Arc::new(AtomicBool::new(false));
+        {
+            let saw = saw_codec_header.clone();
+            thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut s) = conn else { continue };
+                    let _ = s.set_nodelay(true);
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                    let head = read_req(&mut s);
+                    if head.starts_with("GET /health") {
+                        write_health(&mut s);
+                    } else if head.starts_with("GET /stream") {
+                        if head.to_ascii_lowercase().contains("x-micsync-codec: adpcm") {
+                            saw.store(true, Ordering::SeqCst);
+                        }
+                        let mut resp = Vec::new();
+                        resp.extend_from_slice(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                        );
+                        resp.extend_from_slice(MAGIC);
+                        resp.extend_from_slice(&44100u32.to_le_bytes());
+                        resp.extend_from_slice(&1u16.to_le_bytes());
+                        resp.extend_from_slice(&(Codec::Adpcm as u16).to_le_bytes());
+                        if s.write_all(&resp).is_err() {
+                            continue;
+                        }
+                        // 实时节奏发 ADPCM 正弦帧(0.3 幅度,10ms 一帧,约 3 秒)
+                        let mut enc = audio::ImaAdpcm::new();
+                        let mut phase = 0.0f32;
+                        for _ in 0..300 {
+                            let frame: Vec<i16> = (0..441)
+                                .map(|_| {
+                                    let v = (phase * std::f32::consts::TAU).sin() * 0.3;
+                                    phase = (phase + 440.0 / 44100.0).fract();
+                                    (v * i16::MAX as f32) as i16
+                                })
+                                .collect();
+                            let mut buf = Vec::with_capacity(4 + 221);
+                            buf.extend_from_slice(&441u32.to_le_bytes());
+                            enc.encode_into(&frame, &mut buf);
+                            if s.write_all(&buf).is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            });
+        }
+
+        let shared = test_shared(44100);
+        let stop = spawn_claimer(addr, &shared);
+        // 轮询等待,而不是赌一个固定时刻:并行跑测试时调度会拖慢建流
+        let mut ready = false;
+        for _ in 0..80 {
+            if mode_of(&shared) == Mode::Streaming
+                && !shared.buffer.lock().unwrap().is_empty()
+                && shared.prebuffer.load(Ordering::Relaxed) > 0
+            {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            ready,
+            "应进入收流并设置动态水位:mode={:?} buffer={} prebuffer={}",
+            mode_of(&shared),
+            shared.buffer.lock().unwrap().len(),
+            shared.prebuffer.load(Ordering::Relaxed)
+        );
+        assert!(
+            saw_codec_header.load(Ordering::SeqCst),
+            "客户端应在请求头里声明支持 ADPCM"
+        );
+        let peak = {
+            let buf = shared.buffer.lock().unwrap();
+            buf.iter().fold(0.0f32, |a, &s| a.max(s.abs()))
+        };
+        assert!(peak > 0.1, "解码信号应有幅度,peak={peak}");
+        let err = shared.error.lock().unwrap().clone();
+        assert!(err.is_none(), "unexpected error: {err:?}");
+        stop.store(true, Ordering::SeqCst);
     }
 
     /// 网络中断(无结束帧):自动重连,再次认领

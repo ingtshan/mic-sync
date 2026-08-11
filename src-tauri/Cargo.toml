@@ -1,6 +1,6 @@
 [package]
 name = "mic-sync"
-version = "0.6.0"
+version = "0.7.0"
 description = "Share one physical microphone across multiple Macs over LAN"
 edition = "2021"
 

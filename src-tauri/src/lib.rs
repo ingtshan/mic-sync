@@ -18,6 +18,46 @@ use tauri::State;
 
 pub const DEFAULT_PORT: u16 = 47800;
 
+/// 计数分配器(仅测试构建):按线程统计堆分配次数,供音频热路径的
+/// 「稳态零分配」回归测试使用。按线程计数,并行跑的其他测试不会互相干扰
+#[cfg(test)]
+pub mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct CountingAlloc;
+
+    // SAFETY: 全部转发给 System,只额外累加线程本地计数;
+    // Cell<u64> 无析构、const 初始化,alloc 路径上不会递归分配
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.alloc(layout)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: CountingAlloc = CountingAlloc;
+
+    /// 当前线程迄今的分配次数(含 realloc)
+    pub fn allocs_on_this_thread() -> u64 {
+        ALLOCS.with(|c| c.get())
+    }
+}
+
 #[derive(Default)]
 struct AppState {
     server: Mutex<Option<server::ServerHandle>>,
@@ -280,11 +320,17 @@ fn set_input_device(state: State<AppState>, device: Option<String>) {
 }
 
 #[tauri::command]
-fn server_status(state: State<AppState>) -> ServerStatus {
+fn server_status(state: State<AppState>, wave: Option<bool>) -> ServerStatus {
+    // 波形序列只有移动端 UI 用得上;桌面端传 wave=false,
+    // 免去每次轮询对 ~150 个峰值的克隆与 IPC 序列化。缺省 true 兼容旧前端
     let guard = state.server.lock().unwrap();
     match guard.as_ref() {
         Some(h) => {
-            let (wave, wave_seq) = h.wave();
+            let (wave, wave_seq) = if wave.unwrap_or(true) {
+                h.wave()
+            } else {
+                (Vec::new(), 0)
+            };
             ServerStatus {
                 running: true,
                 port: h.port,
@@ -322,6 +368,10 @@ struct ClientStatus {
     output_device: String,
     sample_rate: u32,
     buffer_ms: u32,
+    /// 帧到达抖动估计(毫秒);动态起播水位就是按它调的
+    jitter_ms: u32,
+    /// 本轮播放欠载(声音断一下)累计次数
+    underruns: u32,
     level: f32,
     error: Option<String>,
 }
@@ -336,6 +386,8 @@ fn make_client_status(h: Option<&client::ClientHandle>) -> ClientStatus {
             output_device: h.output_device.clone(),
             sample_rate: h.src_rate(),
             buffer_ms: h.buffer_ms(),
+            jitter_ms: h.jitter_ms(),
+            underruns: h.underruns(),
             level: h.level(),
             error: h.take_error(),
         },
@@ -346,6 +398,8 @@ fn make_client_status(h: Option<&client::ClientHandle>) -> ClientStatus {
             output_device: String::new(),
             sample_rate: 0,
             buffer_ms: 0,
+            jitter_ms: 0,
+            underruns: 0,
             level: 0.0,
             error: None,
         },

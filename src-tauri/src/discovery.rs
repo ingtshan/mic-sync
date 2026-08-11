@@ -137,11 +137,18 @@ fn parse_msg(buf: &[u8]) -> Option<Msg> {
 
 pub struct ResponderHandle {
     stop: Arc<AtomicBool>,
+    thread: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl ResponderHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        // 等应答线程真正退出(recv 超时 300ms 一轮,至多等一轮):发现端口
+        // 没开地址复用,若不等退出就重启监听,新应答器会撞「端口被占」
+        // 而悄悄失效——服务还在,只是再也搜不到
+        if let Some(t) = self.thread.lock().unwrap().take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -175,14 +182,17 @@ pub fn start_responder(server_port: u16) -> Result<ResponderHandle, String> {
         .map_err(|e| format!("设置发现套接字超时失败: {e}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    {
+    let thread = {
         let stop = stop.clone();
         thread::Builder::new()
             .name("mic-discovery".into())
             .spawn(move || responder_thread(socket, server_port, stop))
-            .map_err(|e| format!("创建发现线程失败: {e}"))?;
-    }
-    Ok(ResponderHandle { stop })
+            .map_err(|e| format!("创建发现线程失败: {e}"))?
+    };
+    Ok(ResponderHandle {
+        stop,
+        thread: std::sync::Mutex::new(Some(thread)),
+    })
 }
 
 fn responder_thread(socket: UdpSocket, server_port: u16, stop: Arc<AtomicBool>) {

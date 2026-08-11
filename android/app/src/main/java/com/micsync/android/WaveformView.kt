@@ -25,6 +25,9 @@ class WaveformView @JvmOverloads constructor(
     /** 数据源:返回 (峰值 0~1 序列, 累计块计数);null = 服务未运行 */
     var source: (() -> Pair<FloatArray, Long>?)? = null
 
+    /** 快速序号源:只读累计块计数,没有新块就跳过整份快照拷贝(60fps 下省 GC) */
+    var seqSource: (() -> Long?)? = null
+
     /** 空闲基线是否呼吸(服务待命 true / 已暂停 false) */
     var breathing = false
 
@@ -53,6 +56,8 @@ class WaveformView @JvmOverloads constructor(
     private var gradientH = 0
 
     private fun ingest() {
+        val quickSeq = seqSource?.invoke()
+        if (quickSeq != null && quickSeq == lastSeq) return
         val (arr, seq) = source?.invoke() ?: return
         var fresh = seq - lastSeq
         lastSeq = seq
@@ -88,7 +93,8 @@ class WaveformView @JvmOverloads constructor(
                 x += 9f * d
             }
             paint.alpha = 255
-            postInvalidateOnAnimation()
+            // 空闲基线不必 60fps:呼吸 ~15fps 已够顺滑,暂停态更是几乎静止
+            postInvalidateDelayed(if (breathing) 66L else 250L)
             return
         }
 

@@ -17,6 +17,34 @@ pub const MAGIC: &[u8; 4] = b"MSY1";
 pub const END_SERVER_CLOSING: u32 = 0;
 pub const END_PREEMPTED: u32 = 1;
 
+/// 帧内音频的编码方式,写在流头原「保留」u16 里(旧客户端会忽略它,
+/// 旧服务端总写 0,所以新旧互连自然回落到 PCM):
+/// 客户端在 /stream 请求头 `X-MicSync-Codec` 里报出自己支持的编码,
+/// 服务端择优采用并在流头回告。ADPCM 4:1,局域网带宽从 ~768kbps 降到 ~192kbps
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Codec {
+    Pcm16 = 0,
+    Adpcm = 1,
+}
+
+impl Codec {
+    pub fn from_wire(v: u16) -> Option<Codec> {
+        match v {
+            0 => Some(Codec::Pcm16),
+            1 => Some(Codec::Adpcm),
+            _ => None,
+        }
+    }
+
+    /// 一帧 n 个样本占的载荷字节数
+    pub fn payload_len(&self, n_samples: usize) -> usize {
+        match self {
+            Codec::Pcm16 => n_samples * 2,
+            Codec::Adpcm => n_samples.div_ceil(2),
+        }
+    }
+}
+
 /// 等待用户确认授权的时限。太短会让不在电脑前的人错过请求,
 /// 太长会把对方的客户端吊死在那里——30 秒够按一下弹窗了
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -185,6 +213,12 @@ impl ServerHandle {
         if let Some(p) = self.shared.pending.lock().unwrap().take() {
             let _ = p.decided.try_send(Decision::Deny);
         }
+        // 唤醒阻塞中的 accept 线程:标志已置位,线程返回后立刻退出并释放端口。
+        // 重复 stop(监听器已关)时连接被拒绝,快速失败无副作用
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], self.port)),
+            Duration::from_millis(200),
+        );
     }
 }
 
@@ -219,9 +253,6 @@ fn start_with(
         }
     };
     let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("设置监听器失败: {e}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Shared {
@@ -253,20 +284,27 @@ fn start_with(
     })
 }
 
+/// 阻塞 accept:空闲期零唤醒(此前是 50ms 轮询,常驻后台每秒空转 20 次)。
+/// stop() 会朝本端口发一个唤醒连接,让 accept 立刻返回、线程察觉停止标志退出,
+/// 监听器随之关闭释放端口
 fn accept_thread(listener: TcpListener, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
-    while !stop.load(Ordering::SeqCst) {
+    loop {
         match listener.accept() {
             Ok((stream, addr)) => {
+                // 停止后到达的连接(含唤醒连接)不再受理
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
                 let stop = stop.clone();
                 let shared = shared.clone();
                 let _ = thread::Builder::new()
                     .name(format!("mic-http-{addr}"))
                     .spawn(move || handle_conn(stream, addr, stop, shared));
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
             Err(_) => {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
                 thread::sleep(Duration::from_millis(300));
             }
         }
@@ -542,6 +580,12 @@ fn handle_stream(
     stop: Arc<AtomicBool>,
     shared: Arc<Shared>,
 ) {
+    // 编码协商:对方声明支持 ADPCM 才用(0.7.0 起的客户端);否则回落 PCM
+    let codec = if header_value(head, "x-micsync-codec").contains("adpcm") {
+        Codec::Adpcm
+    } else {
+        Codec::Pcm16
+    };
     // 授权闸门:先确认对方有权使用本机麦克风,再谈开麦。
     // 令牌是服务端签发的私密凭据(不出现在 /health),名字只是展示用的不可信输入
     let token = header_value(head, "x-micsync-token");
@@ -637,17 +681,18 @@ fn handle_stream(
         stream.write_all(
             format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\n{token_header}Connection: close\r\n\r\n").as_bytes(),
         )?;
-        // 二进制流头: MAGIC(4) + sample_rate u32 LE + channels u16 LE + reserved u16
+        // 二进制流头: MAGIC(4) + sample_rate u32 LE + channels u16 LE + codec u16 LE
+        // (codec 位原为保留字段恒 0,旧客户端忽略它 = 恰好按 PCM 解读)
         let mut header = Vec::with_capacity(12);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&rate.to_le_bytes());
         header.extend_from_slice(&1u16.to_le_bytes());
-        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&(codec as u16).to_le_bytes());
         stream.write_all(&header)
     })();
 
     if handshake.is_ok() {
-        write_frames(&mut stream, rx, &stop, &my_end);
+        write_frames(&mut stream, rx, &stop, &my_end, codec);
     }
 
     // 会话收尾:关麦克风、清电平/波形、释放会话(可能已被新会话顶替)
@@ -666,14 +711,17 @@ fn release_session(shared: &Shared, id: u64) {
 }
 
 /// 帧写循环。退出场景:服务停止/被抢占(发 0 长度结束帧告知原因)、
-/// 客户端断开(写失败)、采集中断(Disconnected,直接断连让客户端重试)
+/// 客户端断开(写失败)、采集中断(Disconnected,直接断连让客户端重试)。
+/// 编码在这条网络线程做,不占音频回调;ADPCM 状态跨帧延续,随会话建立/销毁
 fn write_frames(
     stream: &mut TcpStream,
     rx: Receiver<Arc<Vec<i16>>>,
     stop: &AtomicBool,
     end: &AtomicBool,
+    codec: Codec,
 ) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut enc = audio::ImaAdpcm::new();
     loop {
         if stop.load(Ordering::SeqCst) {
             send_end(stream, END_SERVER_CLOSING);
@@ -685,11 +733,18 @@ fn write_frames(
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
-                // 帧: 样本数 u32 LE + i16 LE 样本
+                // 帧: 样本数 u32 LE + 载荷(PCM:每样本 2 字节;ADPCM:每样本半字节)。
+                // buf 跨帧复用,PCM 先一次性定长再按块填充,不做逐样本扩容
                 buf.clear();
                 buf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-                for s in frame.iter() {
-                    buf.extend_from_slice(&s.to_le_bytes());
+                match codec {
+                    Codec::Pcm16 => {
+                        buf.resize(4 + frame.len() * 2, 0);
+                        for (dst, s) in buf[4..].chunks_exact_mut(2).zip(frame.iter()) {
+                            dst.copy_from_slice(&s.to_le_bytes());
+                        }
+                    }
+                    Codec::Adpcm => enc.encode_into(&frame, &mut buf),
                 }
                 if stream.write_all(&buf).is_err() {
                     return;
@@ -703,9 +758,8 @@ fn write_frames(
 
 /// 优雅结束帧:0 长度 + 原因码,客户端据此决定是否自动重连
 fn send_end(stream: &mut TcpStream, reason: u32) {
-    let mut buf = Vec::with_capacity(8);
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&reason.to_le_bytes());
+    let mut buf = [0u8; 8];
+    buf[4..].copy_from_slice(&reason.to_le_bytes());
     let _ = stream.write_all(&buf);
 }
 
@@ -768,11 +822,12 @@ fn capture_thread(
     let sample_format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.into();
 
-    let on_mono = {
-        move |mono: Vec<f32>| {
-            meter.push(audio::peak_level(&mono));
+    // 采集回调是实时线程:单趟混音/量化,除发出去的帧本身外零分配
+    let send_frame = {
+        move |(frame, peak): (Vec<i16>, f32)| {
+            meter.push(peak);
             // 队列满(客户端太慢)或会话已收尾都直接丢帧,由停止信号结束本线程
-            let _ = tx.try_send(Arc::new(audio::f32_to_i16(&mono)));
+            let _ = tx.try_send(Arc::new(frame));
         }
     };
 
@@ -784,9 +839,9 @@ fn capture_thread(
         cpal::SampleFormat::F32 => device.build_input_stream(
             &stream_config,
             {
-                let on_mono = on_mono.clone();
+                let send = send_frame.clone();
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    on_mono(audio::interleaved_to_mono_f32(data, channels));
+                    send(audio::mono_i16_frame(data, channels, |s| s));
                 }
             },
             err_fn,
@@ -795,10 +850,11 @@ fn capture_thread(
         cpal::SampleFormat::I16 => device.build_input_stream(
             &stream_config,
             {
-                let on_mono = on_mono.clone();
+                let send = send_frame.clone();
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let f: Vec<f32> = audio::i16_to_f32(data);
-                    on_mono(audio::interleaved_to_mono_f32(&f, channels));
+                    send(audio::mono_i16_frame(data, channels, |s: i16| {
+                        s as f32 / i16::MAX as f32
+                    }));
                 }
             },
             err_fn,
@@ -807,13 +863,11 @@ fn capture_thread(
         cpal::SampleFormat::U16 => device.build_input_stream(
             &stream_config,
             {
-                let on_mono = on_mono.clone();
+                let send = send_frame.clone();
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let f: Vec<f32> = data
-                        .iter()
-                        .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                        .collect();
-                    on_mono(audio::interleaved_to_mono_f32(&f, channels));
+                    send(audio::mono_i16_frame(data, channels, |s: u16| {
+                        (s as f32 - 32768.0) / 32768.0
+                    }));
                 }
             },
             err_fn,
@@ -1148,6 +1202,60 @@ mod tests {
             wait_until(|| ACTIVE_CAPTURES.load(Ordering::SeqCst) == 0, 3000),
             "mic must be released after server stops"
         );
+    }
+
+    /// 客户端声明支持 ADPCM → 流头回告 codec=1,帧载荷压到每样本半字节;
+    /// 解码后仍是有声的正弦——4:1 带宽是这轮协商换来的,不能悄悄变哑
+    #[test]
+    fn stream_negotiates_adpcm_codec() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let token = settings::trust_client("adpcm 客户端");
+        let mut c = http_get_with(
+            handle.port,
+            "/stream",
+            &format!("X-MicSync-Token: {token}\r\nX-MicSync-Codec: adpcm\r\n"),
+        );
+        let head = read_test_head(&mut c);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut magic = [0u8; 12];
+        c.read_exact(&mut magic).expect("MSY1 header");
+        assert_eq!(&magic[0..4], MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([magic[10], magic[11]]),
+            Codec::Adpcm as u16,
+            "流头应回告 ADPCM"
+        );
+        // 一帧 441 样本 → 221 字节载荷(PCM 是 882 字节)
+        let mut len_buf = [0u8; 4];
+        c.read_exact(&mut len_buf).expect("frame len");
+        let n = u32::from_le_bytes(len_buf) as usize;
+        assert_eq!(n, 441);
+        let mut body = vec![0u8; Codec::Adpcm.payload_len(n)];
+        c.read_exact(&mut body).expect("frame body");
+        let mut dec = audio::ImaAdpcm::new();
+        let mut out = Vec::new();
+        dec.decode_into_f32(&body, n, &mut out);
+        let peak = out.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
+        assert!(peak > 0.2, "解码后应有信号,peak={peak}");
+        settings::revoke_trusted(&token);
+        handle.stop();
+    }
+
+    /// 不带 X-MicSync-Codec 的旧客户端照旧收 PCM,流头 codec 位为 0
+    #[test]
+    fn stream_without_codec_header_stays_pcm() {
+        let _guard = FAKE_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = start_with(None, 0, fake_capture).expect("start");
+        let mut c = http_get_trusted(handle.port, "/stream");
+        let head = read_test_head(&mut c);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut magic = [0u8; 12];
+        c.read_exact(&mut magic).expect("header");
+        assert_eq!(u16::from_le_bytes([magic[10], magic[11]]), 0, "旧客户端必须回落 PCM");
+        let frame = read_frame(&mut c).expect("PCM 帧应可照旧解析");
+        assert_eq!(frame.len(), 441);
+        handle.stop();
     }
 
     /// 麦克风打开失败 → 503 + 错误信息,会话释放
