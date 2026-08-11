@@ -3,3 +3,5 @@ node_modules/
 .DS_Store
 .omc/
 .spec-workflow/
+# Added by code-review-graph
+.code-review-graph/
